@@ -1,0 +1,36 @@
+// T-H7: batched transpose for backward conv1d/conv2d gradient weights:
+//   out[o, b*P + p] = src[b, o*P + p],  src row-major [B, C, P] -> out [C, B*P].
+//
+// This produces exactly the layout conv1d_backward's gw matmul needs:
+// go [B, O, oL] -> go_r [O, B*oL] (the batch axis folds INTO the inner
+// column axis), unlike the 2D transpose kernel which only swaps two axes.
+// Simple direct-read gather (coalesced writes along p; reads are t-contiguous
+// within each (b,o) block) — plenty fast for the ~few M element go buffers.
+//
+// Grid: gx = ceilDiv(C*B*P, 64), gy = 1, gz = 1.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BS { float src[]; };  // [B, C, P] row-major
+layout(set = 0, binding = 1) buffer BD { float dst[]; };           // [C, B*P] row-major
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C;
+    uint P;
+} pc;
+
+void main() {
+    const uint total = pc.C * pc.B * pc.P;
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    const uint bp = pc.B * pc.P;
+    const uint o = idx / bp;      // output row (C dim)
+    const uint rem = idx % bp;
+    const uint b = rem / pc.P;    // batch index
+    const uint p = rem % pc.P;    // inner (time) index
+
+    dst[idx] = src[(b * pc.C + o) * pc.P + p];
+}

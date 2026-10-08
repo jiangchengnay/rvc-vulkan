@@ -1,0 +1,50 @@
+// RMSNorm over the last dim: for each row of x[rows, cols]:
+//   out = x / sqrt(mean(x^2) + eps) * gamma
+//
+// One workgroup (256 threads) per row. Single sum-of-squares reduce, then a
+// strided write pass. Gamma is indexed per column.
+#version 450
+
+#define RVC_NORM_TILE 256
+
+layout(local_size_x = RVC_NORM_TILE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };      // [rows, cols]
+layout(set = 0, binding = 1) readonly buffer BG { float gamma[]; };  // [cols]
+layout(set = 0, binding = 2) buffer BO { float out_data[]; };     // [rows, cols]
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    float eps;
+} pc;
+
+shared float sh_sq[RVC_NORM_TILE];
+shared float sh_inv;
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    if (row >= pc.rows) return;
+
+    const uint base = row * pc.cols;
+    float q = 0.0;
+    for (uint i = lid; i < pc.cols; i += RVC_NORM_TILE) {
+        const float v = x[base + i];
+        q += v * v;
+    }
+    sh_sq[lid] = q;
+    barrier();
+    for (uint d = RVC_NORM_TILE / 2u; d > 0u; d >>= 1u) {
+        if (lid < d) sh_sq[lid] += sh_sq[lid + d];
+        barrier();
+    }
+    if (lid == 0u) {
+        sh_inv = 1.0 / sqrt(sh_sq[0] / float(pc.cols) + pc.eps);
+    }
+    barrier();
+
+    for (uint i = lid; i < pc.cols; i += RVC_NORM_TILE) {
+        out_data[base + i] = x[base + i] * sh_inv * gamma[i];
+    }
+}

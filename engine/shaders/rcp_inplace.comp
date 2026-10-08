@@ -1,0 +1,30 @@
+// In-place elementwise reciprocal: a[i] = 1.0 / a[i].
+// Flat 1D indexing (AMD Radeon Pro VII gid.x-only workaround).
+// float4-vectorised main path (componentwise, result-identical).
+// T4-2 AdamW: rcp(vhat + eps) for the parameter update denominator.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BA { float a[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint i4 = gid * 4u;
+    if (i4 + 3u < pc.N) {
+        vec4 va = vec4(a[i4], a[i4 + 1u], a[i4 + 2u], a[i4 + 3u]);
+        va = 1.0 / va;
+        a[i4] = va.x;
+        a[i4 + 1u] = va.y;
+        a[i4 + 2u] = va.z;
+        a[i4 + 3u] = va.w;
+        return;
+    }
+    for (uint i = i4; i < pc.N && i < i4 + 4u; i++) {
+        a[i] = 1.0 / a[i];
+    }
+}

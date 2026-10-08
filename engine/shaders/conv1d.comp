@@ -1,0 +1,244 @@
+// Tiled 1D convolution template: out[B,C_out,L_out] = conv(x[B,C_in,L],
+// w[C_out,C_in,K]) + b[C_out], stamped into three SPIR-V modules by glslc
+// `-D RVC_TILE=<n>` (16|32|64), mirroring the proven matmul.comp pattern:
+//   RVC_TILE=16: 16x16 output tile, 256 threads, 1 output per thread
+//   RVC_TILE=32: 32x32 output tile, 256 threads, 2x2 per thread
+//   RVC_TILE=64: 64x64 output tile, 256 threads, 4x4 per thread
+// The host picks TILE per shape (engine.zig pickConvTile); small shapes
+// need many small workgroups, big shapes need deep register blocking.
+//
+// Conv1d is an implicit GEMM over the (C_in*K) reduction dimension:
+//   Y[Co, Lo] = sum_{gk} W[Co, gk] * X_col[gk, Lo]
+// where gk = ci*K + k and X_col[gk][ol] = x[ci, ol*stride - pad_l + k*dil]
+// with zero outside [0, L) — the pad/stride/dilation handling lives in the
+// X-tile loader, W is dense. Tiling/reduction/register blocking are copied
+// from matmul.comp (which reached multi-TFLOPS on this GPU), so shared
+// memory layout, bank behaviour and the accumulation ORDER are identical:
+// the K (gk) loop runs monotonically 0..C_in*K-1, exactly the (ci,k)
+// nesting of the old pointwise shader -> bit-identical results per output.
+//
+// AMD Radeon Pro VII lane0 quirk (see matmul.comp): never feed a local id
+// through a multiply with a global id term. Tile coords come from
+// gl_WorkGroupID.{x,y,z} (Lo tile, Co tile, batch) and per-thread offsets
+// from gl_LocalInvocationID only; gl_GlobalInvocationID is never used.
+//
+// Vectorisation (TILE=64 path only, like matmul):
+//   sW rows: W[co][gk] is dense -> vec4 when C_in*K % 4 == 0.
+//   sX cols: 4 consecutive output cols map to 4 consecutive x[] floats
+//            when stride == 1 (dilation only shifts the base offset, the
+//            tap is fixed within one gk row) -> vec4 when stride == 1.
+// Both fall back to guarded scalar loads otherwise; results stay
+// bit-identical (same shared-memory layout, same reduction order).
+#version 450
+
+#ifndef RVC_TILE
+#error "RVC_TILE must be defined (16|32|64)"
+#endif
+
+#define TILE_16 16
+#define TILE_32 32
+#define TILE_64 64
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [B, C_in, L]
+layout(set = 0, binding = 1) readonly buffer BW { float w[]; };   // [C_out, C_in, K]
+layout(set = 0, binding = 2) readonly buffer BB { float b[]; };   // [C_out] (unused when has_bias==0)
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };     // [B, C_out, L_out]
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C_in;
+    uint L;
+    uint C_out;
+    uint K;
+    uint stride;
+    uint pad_l;
+    uint dil;
+    uint L_out;
+    uint has_bias;
+    uint lo_off;    // T1.1 分段：输出段起始绝对列；整段=0
+    uint l_out_full; // T1.1 分段：输出 buffer 行全长（整段寻址步长）；整段=L_out
+} pc;
+
+const uint KB = 16u; // reduction block size (in units of gk = ci*K + k)
+
+#if RVC_TILE == TILE_16
+const uint RPT = 1u;
+shared float sW[16][KB + 1u]; // [16][17] — W tile, padded row stride 17
+shared float sX[KB][16];      // [16][16] — X tile, cols (Lo) consecutive
+#elif RVC_TILE == TILE_32
+const uint RPT = 2u;
+shared float sW[32][KB + 1u]; // [32][17]
+shared float sX[KB][32];      // [16][32]
+#else
+const uint RPT = 4u;
+shared float sW[64][KB + 1u]; // [64][17]
+shared float sX[KB][64];      // [16][64]
+#endif
+
+// Load one X_col element: gk = ci*K + k (reduction index), ol = output col.
+// Returns 0 when gk is past C_in*K, ol past L_out, or the dilated/stride-
+// mapped tap falls outside [0, L) (zero padding).
+// T1.1 分段：ol 为段内列，绝对列 = ol + lo_off（pos 用绝对列映射输入）。
+float load_x(uint gk, uint ol) {
+    if (gk >= pc.C_in * pc.K || ol >= pc.L_out) return 0.0;
+    const uint ci = gk / pc.K;
+    const uint tap = gk - ci * pc.K;
+    const int pos = int(ol + pc.lo_off) * int(pc.stride) + int(tap * pc.dil) - int(pc.pad_l);
+    if (pos < 0 || pos >= int(pc.L)) return 0.0;
+    return x[(gl_WorkGroupID.z * pc.C_in + ci) * pc.L + uint(pos)];
+}
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x; // 0..15, col lane (Lo)
+    const uint ly = gl_LocalInvocationID.y; // 0..15, row lane (Co)
+    const uint tid = ly * 16u + lx;         // 0..255
+
+    // Workgroup -> TILE x TILE output tile (gl_WorkGroupID — never gid*N+lid).
+    const uint tc = gl_WorkGroupID.x;       // Lo tile col
+    const uint tr = gl_WorkGroupID.y;       // Co tile row
+    const uint loBase = tc * uint(RVC_TILE);
+    const uint coBase = tr * uint(RVC_TILE);
+
+    const uint Kdim = pc.C_in * pc.K;       // total reduction length
+
+#if RVC_TILE == TILE_16
+    float acc = 0.0;
+#else
+    float acc[RPT][RPT];
+    for (uint i = 0u; i < RPT; i++)
+        for (uint j = 0u; j < RPT; j++)
+            acc[i][j] = 0.0;
+#endif
+
+    for (uint kt = 0u; kt < Kdim; kt += KB) {
+        // ── Load W tile: sW[TILE][16], TILE*16 elems, RPT per thread ──
+#if RVC_TILE == TILE_64
+        const bool k_aligned = (Kdim & 3u) == 0u;
+        if (k_aligned) {
+            const uint e = tid * 4u;          // 0..1020 step 4
+            const uint r = e >> 4u;           // co row in tile (0..63)
+            const uint cc = (e & 15u) & ~3u;  // 4-aligned gk col in block
+            const uint co = coBase + r;
+            const uint gk = kt + cc;
+            if (co < pc.C_out && gk + 3u < Kdim) {
+                const uint off = co * Kdim + gk;
+                vec4 v = vec4(w[off], w[off + 1u], w[off + 2u], w[off + 3u]);
+                sW[r][cc] = v.x;
+                sW[r][cc + 1u] = v.y;
+                sW[r][cc + 2u] = v.z;
+                sW[r][cc + 3u] = v.w;
+            } else if (co < pc.C_out && gk < Kdim) {
+                for (uint q = 0u; q < 4u; q++) {
+                    sW[r][cc + q] = (gk + q < Kdim) ? w[co * Kdim + gk + q] : 0.0;
+                }
+            } else {
+                sW[r][cc] = 0.0;
+                sW[r][cc + 1u] = 0.0;
+                sW[r][cc + 2u] = 0.0;
+                sW[r][cc + 3u] = 0.0;
+            }
+        } else
+#endif
+        {
+            for (uint t = 0u; t < RPT; t++) {
+                const uint e = tid + t * 256u;  // 0..TILE*16-1
+                const uint r = e >> 4u;         // co row in tile
+                const uint cc = e & 15u;        // gk col in block
+                const uint co = coBase + r;
+                const uint gk = kt + cc;
+                sW[r][cc] = (co < pc.C_out && gk < Kdim) ? w[co * Kdim + gk] : 0.0;
+            }
+        }
+        // ── Load X tile: sX[16][TILE], 16*TILE elems, RPT per thread ──
+#if RVC_TILE == TILE_64
+        const bool s1 = (pc.stride == 1u);
+        if (s1) {
+            const uint e = tid * 4u;          // 0..1020 step 4
+            const uint k = e >> 6u;           // gk row in block (0..15)
+            const uint cc = (e & 63u) & ~3u;  // 4-aligned Lo col in tile
+            const uint gk = kt + k;
+            const uint ol = loBase + cc;
+            if (gk < Kdim && ol + 3u < pc.L_out) {
+                const uint ci = gk / pc.K;
+                const uint tap = gk - ci * pc.K;
+                const int pos = int(ol + pc.lo_off) + int(tap * pc.dil) - int(pc.pad_l);
+                if (pos >= 0 && pos + 3 < int(pc.L)) {
+                    const uint off = (gl_WorkGroupID.z * pc.C_in + ci) * pc.L + uint(pos);
+                    vec4 v = vec4(x[off], x[off + 1u], x[off + 2u], x[off + 3u]);
+                    sX[k][cc] = v.x;
+                    sX[k][cc + 1u] = v.y;
+                    sX[k][cc + 2u] = v.z;
+                    sX[k][cc + 3u] = v.w;
+                } else {
+                    for (uint q = 0u; q < 4u; q++) {
+                        const int p2 = pos + int(q);
+                        sX[k][cc + q] = (p2 >= 0 && p2 < int(pc.L))
+                            ? x[(gl_WorkGroupID.z * pc.C_in + ci) * pc.L + uint(p2)] : 0.0;
+                    }
+                }
+            } else if (gk < Kdim && ol < pc.L_out) {
+                for (uint q = 0u; q < 4u; q++) {
+                    const uint olq = ol + q;
+                    sX[k][cc + q] = (olq < pc.L_out) ? load_x(gk, olq) : 0.0;
+                }
+            } else {
+                sX[k][cc] = 0.0;
+                sX[k][cc + 1u] = 0.0;
+                sX[k][cc + 2u] = 0.0;
+                sX[k][cc + 3u] = 0.0;
+            }
+        } else
+#endif
+        {
+            for (uint t = 0u; t < RPT; t++) {
+                const uint e = tid + t * 256u;  // 0..16*TILE-1
+                const uint k = e / uint(RVC_TILE);   // gk row in block (0..15)
+                const uint cc = e - k * uint(RVC_TILE); // Lo col in tile
+                sX[k][cc] = load_x(kt + k, loBase + cc);
+            }
+        }
+        barrier();
+
+        // ── Accumulate: thread's RPT x RPT output block ──
+        // gk order within the block is cc=0..15, and kt steps by 16 —
+        // monotonically increasing gk, identical to the old shader's
+        // (ci, k) nesting -> bit-identical float accumulation.
+        for (uint kk = 0u; kk < KB; kk++) {
+            for (uint i = 0u; i < RPT; i++) {
+                const float av = sW[ly * RPT + i][kk];
+                for (uint j = 0u; j < RPT; j++) {
+#if RVC_TILE == TILE_16
+                    acc += av * sX[kk][lx];
+#else
+                    acc[i][j] += av * sX[kk][lx * RPT + j];
+#endif
+                }
+            }
+        }
+        barrier(); // protect sW/sX until every lane is done reading
+    }
+
+    // ── Write output (WorkGroupID-derived indices — safe index form) ──
+#if RVC_TILE == TILE_16
+    const uint co = coBase + ly;
+    const uint lo = loBase + lx;
+    if (co < pc.C_out && lo < pc.L_out) {
+        float v = acc;
+        if (pc.has_bias == 1u) v += b[co];
+        out_data[(gl_WorkGroupID.z * pc.C_out + co) * pc.l_out_full + (lo + pc.lo_off)] = v;
+    }
+#else
+    for (uint i = 0u; i < RPT; i++) {
+        const uint co = coBase + ly * RPT + i;
+        if (co >= pc.C_out) break;
+        const float bv = (pc.has_bias == 1u) ? b[co] : 0.0;
+        for (uint j = 0u; j < RPT; j++) {
+            const uint lo = loBase + lx * RPT + j;
+            if (lo >= pc.L_out) break;
+            out_data[(gl_WorkGroupID.z * pc.C_out + co) * pc.l_out_full + (lo + pc.lo_off)] = acc[i][j] + bv;
+        }
+    }
+#endif
+}

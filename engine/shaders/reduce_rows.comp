@@ -1,0 +1,41 @@
+// T-H7: row-wise sum reduction for conv bias gradients:
+//   out[m] = sum_n src[m, n],  src row-major [M, N].
+// Used as gb = reduce_rows(go_r) -> [O] where go_r [O, B*oL] comes from
+// transpose_b, keeping the backward chain fully on GPU (no 23MB go download
+// per layer). One 64-thread workgroup per row, strided accumulate +
+// shared-memory tree reduce.
+//
+// Grid: gx = M, gy = 1, gz = 1.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BS { float src[]; };  // [M, N] row-major
+layout(set = 0, binding = 1) buffer BD { float dst[]; };           // [M]
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+} pc;
+
+shared float sh[64];
+
+void main() {
+    const uint m = gl_WorkGroupID.x;
+    const uint lx = gl_LocalInvocationID.x;
+    float acc = 0.0;
+    for (uint i = lx; i < pc.N; i += 64) {
+        acc += src[m * pc.N + i];
+    }
+    sh[lx] = acc;
+    barrier();
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (lx < s) {
+            sh[lx] += sh[lx + s];
+        }
+        barrier();
+    }
+    if (lx == 0) {
+        dst[m] = sh[0];
+    }
+}

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖（CPU / numpy 路径）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy soundfile
+
+      - name: 导入冒烟（无 torch / 无 Vulkan 时自动回退 numpy）
+        run: |
+          python - <<'EOF'
+          import importlib
+          mods = [
+              "runtime", "runtime.native_config", "runtime.retrieval",
+              "runtime.ivf_index", "runtime.nn", "runtime.backend",
+              "runtime.audio", "runtime.pipeline", "runtime.vc", "runtime.cli",
+              "runtime.models.vits", "runtime.models.hubert",
+              "runtime.models.rmvpe", "runtime.models.fcpe",
+              "runtime.dsp.f0", "runtime.dsp.mel", "runtime.dsp.resample",
+              "runtime.faiss_reader", "runtime.faiss_writer", "runtime.safetensors",
+          ]
+          for m in mods:
+              importlib.import_module(m)
+              print("OK", m)
+          EOF
+
+      - name: 静态检查（禁止 torch/faiss/librosa 泄漏进运行时）
+        run: |
+          python - <<'EOF'
+          import os, re
+          bad = []
+          for root, _, files in os.walk("runtime"):
+              for f in files:
+                  if not f.endswith(".py"):
+                      continue
+                  p = os.path.join(root, f)
+                  for i, line in enumerate(open(p, encoding="utf-8"), 1):
+                      if re.match(r"\s*(import|from)\s+(torch|faiss|librosa|parselmouth|transformers)\b", line):
+                          bad.append(f"{p}:{i}: {line.strip()}")
+          if bad:
+              print("\n".join(bad)); raise SystemExit(1)
+          print("OK: 运行时模块无 torch/faiss/librosa 泄漏")
+          EOF
+
+  engine:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查 Vulkan SDK 环境
+        shell: pwsh
+        run: echo "VULKAN_SDK=$env:VULKAN_SDK"
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+
+      - name: Zig 编译引擎（无 SDK 时验证降级报错路径）
+        shell: pwsh
+        run: |
+          cd engine
+          if ($env:VULKAN_SDK) {
+            zig build -Doptimize=ReleaseFast
+            Write-Host "engine build attempted"
+          } else {
+            Write-Host "VULKAN_SDK 未设置——跳过引擎构建（见 engine/build.zig 的降级提示）"
+          }

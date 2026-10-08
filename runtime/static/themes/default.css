@@ -1,0 +1,42 @@
+/* ============================================================
+   RVC-Vulkan 默认主题（CSS 变量）
+   主题包机制：把自定义主题放到 runtime/static/themes/<名字>/ 下，
+   包含 theme.css（覆盖下列变量）与 theme.json（名称/作者/说明）。
+   前端通过右上角"主题"下拉切换（data-theme 属性）。
+   本文件即"默认主题"，同时承载全部组件样式（新控件沿用 var(--*)）。
+   ============================================================ */
+:root {
+    /* 背景与卡片（原版 RVC 深色观感） */
+    --bg: #0b0f19;
+    --bg-image: linear-gradient(165deg, #0b0f19 0%, #111a2e 55%, #0e1424 100%);
+    --card: #161d30;
+    --card-hover: #1d2740;
+    --border: #2a3550;
+
+    /* 文字 */
+    --fg: #e6ecfa;
+    --muted: #8b9cc2;
+    --heading: #ffffff;
+
+    /* 强调色（原版权重感蓝） */
+    --accent: #4f8cff;
+    --accent-hover: #3d7ae8;
+    --ok: #3ddc84;
+    --err: #ff5d5d;
+    --warn: #ffb84d;
+
+    /* 组件 */
+    --radius: 10px;
+    --shadow: 0 3px 10px rgba(0, 0, 0, .45);
+    --font: "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: "Cascadia Code", Consolas, "JetBrains Mono", monospace;
+
+    /* P2 新增组件变量 */
+    --input-bg: #0e1424;             /* 输入框/下拉底色 */
+    --slider-track: #273049;         /* 滑块轨道 */
+    --console-bg: #0a0e18;           /* 实时日志面板 */
+    --console-fg: #c8d6f0;           /* 日志默认文字 */
+}
+
+/* 深色/浅色等其它主题只需在 runtime/static/themes/<名字>/theme.css
+   里重新声明这些变量（同文件内可加自定义类）。默认主题即本文件。 */

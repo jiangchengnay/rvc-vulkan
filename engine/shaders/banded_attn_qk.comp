@@ -1,0 +1,67 @@
+// Banded attention scores (T5 relative-position fused): q/k [T, C]
+// head-interleaved (head h at columns [h*D, (h+1)*D)), used[2T-1, D] is
+// the relative-position embedding (offset m = s - t + T - 1). Computes
+//   scores[h, t, s] = sum_d q[t, h*D+d] * (k[s, h*D+d] + used[s-t+T-1, d])
+// into out[H, T, T]. Mathematically identical to
+//   scores = q@k^T + rel_to_abs(q@used^T)   (RVC enc_p T5 相对位置注意力)
+// but folds both matmuls into ONE kernel — no [H,P,2P-1] intermediate
+// round-trip (D5: v1 的 rel_logits/rel_w 数组 CPU↔GPU 传输是性能灾难，
+// 实测 dec 60s 17.2s 反超基线 15.99s；融合后每层只传 q/k/v/used + scores)。
+// Float result differs from the two-matmul order only by summation order
+// (~1e-6 rel — 有据差异，见 D5 报告).
+//
+// One 16x16 workgroup per (h, t-tile, s-tile); gx=gy=ceil(T/16), gz=H.
+// used 按 (s-t) 对角索引、线程内 d 顺序读 —— 对固定 (t,s) 顺序访问，缓存友好。
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BQ { float q[]; };       // [T, C]
+layout(set = 0, binding = 1) readonly buffer BK { float k[]; };       // [T, C]
+layout(set = 0, binding = 2) readonly buffer BU { float used[]; };    // [2T-1, D]
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };         // [H, T, T]
+
+layout(push_constant) uniform PC {
+    uint H;
+    uint T;
+    uint D;   // head dim (<= 128 shared capacity)
+    uint C;   // = H * D
+} pc;
+
+shared float sQ[16][128];
+shared float sK[16][128];
+
+void main() {
+    const uint h    = gl_GlobalInvocationID.z;
+    const uint t0   = gl_WorkGroupID.y * 16u;
+    const uint s0   = gl_WorkGroupID.x * 16u;
+    const uint lx   = gl_LocalInvocationID.x;  // col lane
+    const uint ly   = gl_LocalInvocationID.y;  // row lane
+    const uint tid  = ly * 16u + lx;
+
+    const uint hd = h * pc.D;
+
+    for (uint e = tid; e < 16u * 128u; e += 256u) {
+        const uint r = e >> 7u;
+        const uint d = e & 127u;
+        const uint tt = t0 + r;
+        sQ[r][d] = (tt < pc.T && d < pc.D) ? q[tt * pc.C + hd + d] : 0.0;
+    }
+    for (uint e = tid; e < 16u * 128u; e += 256u) {
+        const uint r = e >> 7u;
+        const uint d = e & 127u;
+        const uint ss = s0 + r;
+        sK[r][d] = (ss < pc.T && d < pc.D) ? k[ss * pc.C + hd + d] : 0.0;
+    }
+    barrier();
+
+    const uint tt = t0 + ly;
+    const uint ss = s0 + lx;
+    if (tt < pc.T && ss < pc.T) {
+        float acc = 0.0;
+        const uint m = ss - tt + pc.T - 1u;  // relative offset in [0, 2T-2]
+        const uint ub = m * pc.D;
+        for (uint d = 0u; d < pc.D; d++) acc += sQ[ly][d] * (sK[lx][d] + used[ub + d]);
+        out_data[h * pc.T * pc.T + tt * pc.T + ss] = acc;
+    }
+}

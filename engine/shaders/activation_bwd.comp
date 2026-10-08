@@ -1,0 +1,32 @@
+// Elementwise activation backward — one shader, two dispatch modes
+// (engine BatchEntry binds <=4 buffers; mode via push constant):
+//   mode 0: sigmoid_bwd  dst = go * s * (1 - s)   s = out (sigmoid 前向输出)
+//   mode 1: tanh_bwd     dst = go * (1 - t * t)   t = out (tanh 前向输出)
+// 以『前向输出』为输入；f64 计算 → f32。
+// 输入 out（前向激活值）与 go（输出梯度），逐元素一线程，grid gx=ceilDiv(n,256)。
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BGO { float go[]; };   // 输出梯度
+layout(set = 0, binding = 1) readonly buffer BOUT { float o[]; };   // 前向激活
+layout(set = 0, binding = 2) buffer BD { float dst[]; };            // 输入梯度
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint mode;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    const float g = go[i];
+    const float v = o[i];
+    float d;
+    if (pc.mode == 0u) {
+        d = v * (1.0 - v);   // sigmoid'
+    } else {
+        d = 1.0 - v * v;     // tanh'
+    }
+    dst[i] = g * d;
+}

@@ -1,0 +1,95 @@
+@echo off
+rem ============================================================
+rem  RVC-Vulkan launcher (packaged distribution v0.99.0)
+rem
+rem  Usage:
+rem    rvc.cmd                start WebUI backend (port 7865)
+rem    rvc.cmd webui          same as above
+rem    rvc.cmd cli [args]     run CLI (pass --help for options)
+rem    rvc.cmd check          verify engine DLL + backend probe
+rem    rvc.cmd help           show this help
+rem
+rem  Supported device scope: Windows 10+, AMD Radeon Pro VII (Vega20)
+rem  with Vulkan driver. Other GPUs may work but are NOT verified:
+rem  workgroup grid limits are hardcoded to Radeon Pro VII (P-BE-006);
+rem  run "rvc.cmd check" to probe engine create/destroy on your machine.
+rem ============================================================
+chcp 65001 >nul
+cd /d "%~dp0"
+set "MODE=%~1"
+if "%MODE%"=="" set "MODE=webui"
+
+rem ---- locate python: vendored > project venv > PATH ----
+set "PY=python"
+if exist "python\python.exe" set "PY=python\python.exe"
+if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
+%PY% -c "import sys" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Python not found. Install Python 3.10+ and add it to PATH,
+    echo         or place an embedded runtime under .\python\ .
+    pause
+    exit /b 1
+)
+
+rem ---- engine DLL check (hard requirement for the vulkan backend) ----
+if not exist "engine\zig-out\bin\rvc_core.dll" (
+    echo [ERROR] rvc_core.dll missing: engine\zig-out\bin\rvc_core.dll
+    echo         This package is incomplete - re-download or rebuild the engine.
+    pause
+    exit /b 1
+)
+
+rem ---- dependency check (auto-install from bundled manifest) ----
+%PY% -c "import numpy,scipy,soundfile" >nul 2>nul
+if errorlevel 1 (
+    echo [SETUP] missing dependencies, installing from requirements-vulkan.txt ...
+    %PY% -m pip install -r requirements-vulkan.txt
+    if errorlevel 1 (
+        echo [ERROR] dependency install failed. Run manually:
+        echo         %PY% -m pip install -r requirements-vulkan.txt
+        pause
+        exit /b 1
+    )
+)
+
+if /i "%MODE%"=="check"    goto :check
+if /i "%MODE%"=="help"     goto :help
+if /i "%MODE%"=="cli"      goto :cli
+if /i "%MODE%"=="webui"    goto :webui
+echo [ERROR] unknown mode: %MODE%   ^(see "rvc.cmd help"^)
+exit /b 2
+
+:check
+echo ============================================================
+echo   RVC-Vulkan self-check
+echo   - verifies rvc_core.dll presence
+echo   - probes backend: engine create/destroy round-trip (P-BE-015)
+echo ============================================================
+%PY% -c "from runtime import backend as b; print('available backends:', b.available_backends())"
+pause
+exit /b 0
+
+:help
+echo   webui     start WebUI backend at http://127.0.0.1:7865
+echo   cli       run command-line inference (runtime.cli --help)
+echo   check     verify engine DLL and probe vulkan backend
+echo   help      show this message
+echo.
+echo Docs: see README.md in this package.
+exit /b 0
+
+:cli
+%PY% -m runtime.cli %~2 %~3 %~4 %~5 %~6 %~7 %~8 %~9
+exit /b %errorlevel%
+
+exit /b %errorlevel%
+
+:webui
+echo ============================================================
+echo   Starting RVC-Vulkan WebUI ...
+echo   Browser will open http://127.0.0.1:7865
+echo   Close this window or press Ctrl+C to stop
+echo ============================================================
+%PY% -m runtime.api --port 7865 --open
+exit /b %errorlevel%
+

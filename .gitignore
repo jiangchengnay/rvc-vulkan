@@ -1,0 +1,39 @@
+# ==== 权重与数据（体积大，不提交）====
+assets/hubert_base/
+assets/rmvpe/
+assets/fcpe/
+assets/pretrained/
+assets/pretrained_v2/
+assets/weights/
+assets/indices/
+assets/pymss_weights/
+logs/
+.model-downloads/
+
+# ==== Python ====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+_tmp_*/
+.tmp_*/
+*.egg-info/
+build/
+
+# ==== 引擎构建产物（本地编译，不入库）====
+engine/.zig-cache/
+engine/zig-out/
+engine/zig-out-dev/
+rvc_core.cache
+
+# ==== 运行产物 ====
+*.npz
+*.npy
+*.pt
+*.pth
+*.index
+*.wav
+*.pkf
+/输出/
+/workspaces/
+/TEMP/

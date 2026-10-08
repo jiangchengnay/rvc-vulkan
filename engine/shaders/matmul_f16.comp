@@ -1,0 +1,139 @@
+// Tiled FP16-input matrix multiply. C[M,N] = A[M,K] x B[K,N], row-major.
+// Experiment (P1-4): A/B are float16 storage buffers (weights/activations
+// uploaded as half), C accumulates in float32 and is written as f32 —
+// precision-safe (half input quantisation is the only error source).
+//
+// Same skeleton as matmul.comp (stamped via `-DRVC_TILE=<n>` 16|32|64):
+//   RVC_TILE=16: 16x16 tile, 256 threads, 1 output per thread
+//   RVC_TILE=32: 32x32 tile, 256 threads, 2x2 per thread
+//   RVC_TILE=64: 64x64 tile, 256 threads, 4x4 per thread
+// Shared memory stores FLOAT32 (loads convert half->float at staging),
+// so the inner loop is identical to the f32 kernel — this isolates the
+// FP16 hardware win (bandwidth + possible fp16 ALU) from any shared-mem
+// packing complexity. K/N%2==0 is recommended (natural 2-byte loads);
+// odd shapes still work via scalar reads.
+//
+// The Radeon Pro VII lane0 quirk note from matmul.comp applies verbatim:
+// tile coords come from gl_WorkGroupID, per-thread offsets from
+// gl_LocalInvocationID only; gl_GlobalInvocationID is never multiplied.
+#version 450
+
+#ifndef RVC_TILE
+#error "RVC_TILE must be defined (16|32|64)"
+#endif
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define TILE_16 16
+#define TILE_32 32
+#define TILE_64 64
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BA { float16_t a[]; }; // M x K (f16)
+layout(set = 0, binding = 1) readonly buffer BB { float16_t b[]; }; // K x N (f16)
+layout(set = 0, binding = 2) buffer BC { float c[]; };              // M x N (f32)
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint K;
+    uint N;
+    uint TILE;  // == RVC_TILE; runtime copy kept for the host contract
+} pc;
+
+const uint KB = 16u; // K block size
+
+// Variant B (bench): shared memory stores FLOAT16 too — halves shared-
+// memory bandwidth and footprint; the accumulate loop converts half->f32
+// on read. Isolates whether the shared-mem round-trip (not the input
+// bandwidth) is the limiter.
+#if RVC_TILE == TILE_16
+const uint RPT = 1u;
+shared float16_t sA[16][KB + 1u]; // [16][17]
+shared float16_t sB[KB][16];      // [16][16]
+#elif RVC_TILE == TILE_32
+const uint RPT = 2u;
+shared float16_t sA[32][KB + 1u]; // [32][17]
+shared float16_t sB[KB][32];      // [16][32]
+#else
+const uint RPT = 4u;
+shared float16_t sA[64][KB + 1u]; // [64][17]
+shared float16_t sB[KB][64];      // [16][64]
+#endif
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x; // 0..15, col lane
+    const uint ly = gl_LocalInvocationID.y; // 0..15, row lane
+    const uint tid = ly * 16u + lx;         // 0..255
+
+    const uint tr = gl_WorkGroupID.y;       // tile row index
+    const uint tc = gl_WorkGroupID.x;       // tile col index
+    const uint rowBase = tr * uint(RVC_TILE);
+    const uint colBase = tc * uint(RVC_TILE);
+
+#if RVC_TILE == TILE_16
+    float acc = 0.0;
+#else
+    float acc[RPT][RPT];
+    for (uint i = 0u; i < RPT; i++)
+        for (uint j = 0u; j < RPT; j++)
+            acc[i][j] = 0.0;
+#endif
+
+    for (uint kt = 0u; kt < pc.K; kt += KB) {
+        // ── Load A tile (half -> float into sA) ──
+        for (uint t = 0u; t < RPT; t++) {
+            const uint e = tid + t * 256u;  // 0..TILE*16-1
+            const uint r = e >> 4u;         // row in tile
+            const uint cc = e & 15u;        // k col in block
+            const uint row = rowBase + r;
+            const uint kk = kt + cc;
+            sA[r][cc] = (row < pc.M && kk < pc.K) ? a[row * pc.K + kk] : float16_t(0.0);
+        }
+        // ── Load B tile (half -> float into sB) ──
+        for (uint t = 0u; t < RPT; t++) {
+            const uint e = tid + t * 256u;  // 0..16*TILE-1
+            const uint k = e / uint(RVC_TILE);   // k row in block (0..15)
+            const uint cc = e - k * uint(RVC_TILE); // col in tile
+            const uint kk = kt + k;
+            const uint col = colBase + cc;
+            sB[k][cc] = (kk < pc.K && col < pc.N) ? b[kk * pc.N + col] : float16_t(0.0);
+        }
+        barrier();
+
+        // ── Accumulate (f32): thread's RPT x RPT output block ──
+        for (uint kk = 0u; kk < KB; kk++) {
+            for (uint i = 0u; i < RPT; i++) {
+                const float av = float(sA[ly * RPT + i][kk]);
+                for (uint j = 0u; j < RPT; j++) {
+#if RVC_TILE == TILE_16
+                    acc += av * float(sB[kk][lx]);
+#else
+                    acc[i][j] += av * float(sB[kk][lx * RPT + j]);
+#endif
+                }
+            }
+        }
+        barrier(); // protect sA/sB until every lane is done reading
+    }
+
+    // ── Write C (WorkGroupID-derived row/col * N — safe index form) ──
+#if RVC_TILE == TILE_16
+    const uint ro = rowBase + ly;
+    const uint co = colBase + lx;
+    if (ro < pc.M && co < pc.N) c[ro * pc.N + co] = acc;
+#else
+    const uint r0 = rowBase + ly * RPT;
+    const uint c0 = colBase + lx * RPT;
+    for (uint i = 0u; i < RPT; i++) {
+        const uint row = r0 + i;
+        if (row >= pc.M) break;
+        for (uint j = 0u; j < RPT; j++) {
+            const uint col = c0 + j;
+            if (col >= pc.N) break;
+            c[row * pc.N + col] = acc[i][j];
+        }
+    }
+#endif
+}

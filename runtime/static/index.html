@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="zh" data-theme="default">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RVC-Vulkan 变声器</title>
+<link rel="stylesheet" href="/themes/default.css">
+<style>
+/* ============ 基础 ============ */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);background-image:var(--bg-image);background-attachment:fixed;color:var(--fg);font-family:var(--font);min-height:100vh}
+.wrap{max-width:1180px;margin:0 auto;padding:22px 20px 60px}
+
+/* ============ 顶栏 ============ */
+header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding-bottom:14px;border-bottom:1px solid var(--border);margin-bottom:16px}
+header h1{font-size:23px;color:var(--heading);letter-spacing:.5px}
+.thirdparty{font-size:12px;color:var(--muted);background:var(--card);border:1px solid var(--border);padding:5px 12px;border-radius:var(--radius)}
+.toolbar{display:flex;gap:10px;align-items:center;font-size:13px}
+#health{padding:5px 14px;border-radius:var(--radius);background:var(--card);color:var(--muted);font-size:12px;border:1px solid var(--border)}
+
+/* ============ Tab 导航（原版风格） ============ */
+nav{display:flex;gap:4px;margin-bottom:18px;flex-wrap:wrap;border-bottom:2px solid var(--border);padding-bottom:0}
+.tab{padding:10px 26px;cursor:pointer;font-size:14px;color:var(--muted);border:1px solid transparent;border-bottom:none;border-radius:var(--radius) var(--radius) 0 0;background:transparent;transition:all .15s;user-select:none}
+.tab:hover{color:var(--fg);background:var(--card-hover)}
+.tab.active{color:var(--heading);background:var(--card);border-color:var(--border);border-bottom:2px solid var(--accent);font-weight:600}
+.page{display:none}
+.page.show{display:block}
+
+/* ============ 卡片与分区标题 ============ */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px 22px;margin-bottom:18px;box-shadow:var(--shadow)}
+.card h2{font-size:15px;color:var(--heading);margin-bottom:16px;padding-bottom:9px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;letter-spacing:.4px}
+.card h2 .step{color:var(--accent);font-size:13px}
+.card h2 .tag{font-size:11px;font-weight:400;color:var(--warn);border:1px solid var(--warn);border-radius:20px;padding:2px 10px}
+.subtitle{font-size:12px;color:var(--muted);margin:-8px 0 14px}
+
+/* ============ 行布局 ============ */
+.row{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;align-items:flex-end}
+.row>*{flex:1;min-width:150px}
+.row .grow{flex:2}
+
+/* ============ 表单控件统一（原版观感） ============ */
+.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;font-weight:500}
+select,input[type=text],input[type=number],input[type=file]{
+  width:100%;padding:9px 12px;border-radius:var(--radius);border:1px solid var(--border);
+  background:var(--input-bg);color:var(--fg);font-size:13px;transition:border-color .15s;
+}
+select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--accent);outline:none}
+select option{background:var(--card);color:var(--fg)}
+input[type=file]{padding:7px 10px;cursor:pointer}
+input[type=file]::file-selector-button{margin-right:10px;padding:5px 14px;border:none;border-radius:6px;background:var(--border);color:var(--fg);cursor:pointer;font-size:12px}
+input[type=file]::file-selector-button:hover{background:var(--card-hover)}
+
+/* ============ 按钮（原版圆角主/次） ============ */
+button{
+  padding:9px 20px;border-radius:var(--radius);border:none;background:var(--accent);color:#fff;
+  cursor:pointer;font-weight:600;font-size:13px;letter-spacing:.3px;transition:background .15s,transform .05s;
+  min-width:120px;
+}
+button:hover{background:var(--accent-hover)}
+button:active{transform:translateY(1px)}
+button:disabled{opacity:.45;cursor:wait}
+button.ghost{background:var(--card);border:1px solid var(--border);color:var(--fg);font-weight:500;min-width:90px}
+button.ghost:hover{background:var(--card-hover)}
+button.small{padding:6px 14px;min-width:0;font-size:12px}
+
+/* ============ 滑块（原版 gr.Slider 观感） ============ */
+.slider-wrap{position:relative;padding-bottom:18px}
+.slider-wrap label{display:block;font-size:12px;color:var(--muted);margin-bottom:8px;font-weight:500}
+.slider-wrap .sval{position:absolute;right:0;top:-2px;font-size:12px;color:var(--accent);background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:2px 9px;font-family:var(--mono)}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:4px;background:var(--slider-track);outline:none;cursor:pointer;margin:2px 0}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:17px;height:17px;border-radius:50%;background:var(--accent);border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);cursor:grab;transition:transform .1s}
+input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.12)}
+input[type=range]::-moz-range-thumb{width:15px;height:15px;border-radius:50%;background:var(--accent);border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);cursor:grab}
+input[type=range]:disabled{opacity:.4;cursor:not-allowed}
+
+/* ============ 进度条（真实按块推进） ============ */
+.progress-block{display:none;margin:6px 0 14px}
+.progress-block.show{display:block}
+.bar{height:8px;background:var(--slider-track);border-radius:5px;overflow:hidden;position:relative}
+.fill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-hover));transition:width .35s ease;border-radius:5px}
+.pct{font-size:12px;color:var(--muted);margin-top:5px;text-align:right;font-family:var(--mono)}
+.pct b{color:var(--accent)}
+
+/* ============ 日志控制台（实时） ============ */
+.console{background:var(--console-bg);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-top:12px;height:230px;overflow-y:auto;font-family:var(--mono);font-size:12px;line-height:1.75;color:var(--console-fg);white-space:pre-wrap;word-break:break-all}
+.console .log-line{display:block}
+.console .t-progress{color:var(--ok)}
+.console .t-batch{color:var(--accent)}
+.console .t-err{color:var(--err)}
+.console::-webkit-scrollbar{width:8px}
+.console::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+
+/* ============ 试听 / 结果 ============ */
+#result{margin-top:8px}
+#result audio,#preview{width:100%;margin-top:10px;border-radius:var(--radius)}
+.ok{color:var(--ok);font-size:13px;margin-top:8px}
+.err{color:var(--err);font-size:13px;margin-top:8px}
+.warn{color:var(--warn);font-size:13px;margin-top:8px;line-height:1.8}
+a.dl{display:inline-block;margin-top:10px;padding:8px 18px;border-radius:var(--radius);background:var(--card-hover);border:1px solid var(--border);color:var(--accent);text-decoration:none;font-size:13px;font-weight:600}
+a.dl:hover{border-color:var(--accent)}
+
+/* ============ 批量结果表 ============ */
+table.files{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+table.files th,table.files td{padding:9px 12px;border-bottom:1px solid var(--border);text-align:left}
+table.files th{color:var(--muted);font-size:12px;font-weight:500;background:var(--input-bg)}
+table.files tr:hover td{background:var(--card-hover)}
+table.files .ok-ico{color:var(--ok);font-weight:700}
+table.files .no-ico{color:var(--err);font-weight:700}
+table.files .marked{opacity:.55;text-decoration:line-through}
+table.files .btn-mark{padding:4px 12px;min-width:0;font-size:12px;background:transparent;border:1px solid var(--warn);color:var(--warn);font-weight:400}
+table.files .btn-mark:hover{background:var(--warn);color:#000}
+table.files .btn-mark.marked{background:var(--warn);color:#000;opacity:.8}
+code{font-family:var(--mono);background:var(--input-bg);padding:1px 7px;border-radius:5px;font-size:12px}
+ul{margin-left:20px;line-height:2}
+a{color:var(--accent)}
+
+/* ============ 页脚 ============ */
+footer{margin-top:30px;padding-top:14px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);text-align:center;line-height:1.9}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <h1>🎙️ RVC-Vulkan 变声器</h1>
+    <div class="thirdparty">第三方个人项目 · 非 RVC 官方仓库 · 基于 <b>RVC-Project</b> 的去 CUDA 移植</div>
+  </div>
+  <div class="toolbar">
+    <select id="themeSel" title="主题包（预留扩展）" style="width:auto;padding:5px 12px"><option value="default">主题：默认</option></select>
+    <span id="health">检测中…</span>
+  </div>
+</header>
+
+<nav>
+  <div class="tab active" data-p="infer">模型推理</div>
+  <div class="tab" data-p="train">训练</div>
+  <div class="tab" data-p="tools">模型工具</div>
+  <div class="tab" data-p="files">文件管理</div>
+  <div class="tab" data-p="about">关于</div>
+</nav>
+
+<!-- ================= 模型推理（对齐原版推理页交互） ================= -->
+<div class="page show" id="p-infer">
+  <div class="card">
+    <h2><span class="step">▶</span>模型推理</h2>
+
+    <div class="row">
+      <div class="field grow"><label>选择模型（models/ 优先，assets 兼容）</label>
+        <select id="model" onchange="onModelChange()"><option>加载中…</option></select></div>
+      <div class="field"><label>　</label><button class="ghost" onclick="refreshModels()">↻ 刷新</button></div>
+      <div class="field"><label>F0 方法</label><select id="f0">
+        <option value="rmvpe">rmvpe（推荐）</option><option value="pm">pm</option><option value="fcpe">fcpe</option></select></div>
+    </div>
+
+    <div class="row">
+      <div class="slider-wrap"><label>说话人 ID</label>
+        <input type="range" id="spk" min="0" max="0" value="0" step="1">
+        <span class="sval" id="spkVal">0</span></div>
+      <div class="slider-wrap"><label>变调（半音，-24 ~ +24）</label>
+        <input type="range" id="pitch" min="-24" max="24" value="0" step="1">
+        <span class="sval" id="pitchVal">0</span></div>
+      <div class="slider-wrap"><label>切分长度（秒，0=自动/38s；≥38s无效，16G显存建议10s）</label>
+        <input type="range" id="slice" min="0" max="37.5" value="10" step="0.5">
+        <span class="sval" id="sliceVal">10s</span></div>
+    </div>
+
+    <div class="row">
+      <div class="field grow"><label>输入音频（wav/flac/ogg/opus…，上传后即可试听）</label>
+        <input id="audio" type="file" accept="audio/*" onchange="previewAudio()"></div>
+      <div class="field"><label>　</label><button id="go" onclick="convert()">🎤 开始变声</button></div>
+    </div>
+    <div id="previewBox" style="display:none"><audio id="preview" controls></audio></div>
+
+    <div class="row">
+      <div class="field grow"><label>特征索引（自动匹配优先，可下拉选择）</label>
+        <select id="idx" onchange="idxChanged()">
+          <option value="">自动匹配（推荐）</option>
+          <option value="__none__">不使用索引</option>
+        </select>
+        <div id="idxStatus" style="font-size:12px;margin-top:5px;color:var(--muted)">—</div></div>
+    </div>
+
+    <div class="row">
+      <div class="slider-wrap"><label>索引率（0 ~ 1）</label>
+        <input type="range" id="idxr" min="0" max="1" value="0.75" step="0.05">
+        <span class="sval" id="idxrVal">0.75</span></div>
+      <div class="slider-wrap"><label>检索模式</label>
+        <select id="rmode" style="width:100%">
+          <option value="ivf">正版(IVF近似)</option>
+          <option value="brute">暴力检索</option>
+        </select></div>
+      <div class="slider-wrap"><label>暴力混合比例（0 ~ 1）</label>
+        <input type="range" id="brmix" min="0" max="1" value="0" step="0.05">
+        <span class="sval" id="brmixVal">0.00</span></div>
+      <div class="slider-wrap"><label>保护（0 ~ 0.5）</label>
+        <input type="range" id="prot" min="0" max="0.5" value="0.33" step="0.01">
+        <span class="sval" id="protVal">0.33</span></div>
+      <div class="slider-wrap"><label>说话清晰度（0=口齿不清复现 1=清晰）</label>
+        <input type="range" id="clmix" min="0" max="1" value="1" step="0.05">
+        <span class="sval" id="clmixVal">1.00（清晰）</span></div>
+      <div class="slider-wrap"><label>RMS 混合率（0 ~ 1）</label>
+        <input type="range" id="rms" min="0" max="1" value="1.0" step="0.05">
+        <span class="sval" id="rmsVal">1.00</span></div>
+      <div class="slider-wrap"><label>输出采样率（0=模型原生）</label>
+        <input type="range" id="resr" min="0" max="48000" value="0" step="1000">
+        <span class="sval" id="resrVal">0（原生）</span></div>
+    </div>
+
+    <div class="progress-block" id="inferProg">
+      <div class="bar"><div class="fill" id="inferFill"></div></div>
+      <div class="pct" id="inferPct">0%</div>
+    </div>
+    <div id="result"></div>
+    <div class="console" id="inferLog"><span class="log-line t-err">— 实时日志：推理/批量输出将显示在这里 —</span></div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">▶</span>批量变声 <span class="tag">多文件 / 目录</span></h2>
+    <div class="row">
+      <div class="field grow"><label>多文件上传（可拖入多个音频）</label>
+        <input id="batchFiles" type="file" accept="audio/*" multiple></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>或服务器目录 in_dir（可选）</label><input id="batchInDir" type="text" placeholder="E:\dataset\in"></div>
+      <div class="field"><label>输出目录 out_dir（可选）</label><input id="batchOutDir" type="text" placeholder="留空=与输入同目录"></div>
+    </div>
+    <div class="row">
+      <button id="batchGo" onclick="batchGo()">⚡ 批量变声</button>
+      <button class="ghost" id="batchZipBtn" onclick="batchZip()" disabled>📦 打包下载 zip</button>
+    </div>
+    <div class="progress-block" id="batchProg">
+      <div class="bar"><div class="fill" id="batchFill"></div></div>
+      <div class="pct" id="batchPct">0%</div>
+    </div>
+    <div id="batchResult"></div>
+  </div>
+</div>
+
+<!-- ================= 训练 ================= -->
+<div class="page" id="p-train">
+  <div class="card">
+    <h2><span class="step">▶</span>训练工作区（项目）<span class="tag">自研架构</span></h2>
+    <div class="row">
+      <div class="field"><label>新建项目名（中文）</label><input id="projName" type="text" placeholder="大肥鱼"></div>
+      <div class="field"><label>采样率</label><select id="projSr"><option value="48000">48k</option><option value="40000">40k</option><option value="32000">32k</option></select></div>
+      <div class="field"><label>模式</label><select id="projMode"><option value="single">单说话人</option><option value="multi">多说话人</option></select></div>
+      <div class="field"><label>　</label><button onclick="newProject()">新建项目</button></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>选择已有项目</label><select id="projList"><option>（暂无项目）</option></select></div>
+      <div class="field"><label>　</label><button onclick="loadProject()">挂载项目</button></div>
+      <div class="field grow"><label>挂载任务（检索当前项目下的任务）</label><select id="taskSel"><option value="">（请先挂载项目）</option></select></div>
+      <div class="field"><label>　</label><button onclick="mountTask()">挂载任务</button></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>新任务名（中文，如：大肥鱼1）</label><input id="taskTag" type="text" placeholder="大肥鱼1"></div>
+      <div class="field"><label>　</label><button onclick="newTask()">新建任务</button></div>
+    </div>
+    <div id="projInfo" style="font-size:13px;color:var(--muted);margin-top:8px"></div>
+    <div class="warn">自研工作区：项目目录 <code>workspaces/&lt;项目&gt;/</code>（含本项目专用 <code>rvc-project.json</code>，
+      不魔改原版 configs/*.json）；每个任务一个文件夹 <code>workspaces/&lt;项目&gt;/&lt;任务&gt;/</code>，
+      内含 <code>exp</code>（切片音频/特征/训练产物）、<code>checkpoints</code>（模型/续训）、<code>out</code>（成品）。
+      项目与任务名均支持中文，不依赖原版 logs/&lt;exp&gt; 目录。</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">①</span>数据切分（预处理）</h2>
+    <div class="row">
+      <div class="field grow"><label>输入目录（含音频文件）</label><input id="tr_inp" placeholder="E:\dataset\raw"></div>
+      <div class="field"><label>采样率</label><input id="tr_sr" type="number" value="48000" min="16000"></div>
+      <div class="field"><label>每段时长（秒）</label><input id="tr_per" type="number" value="3.7" step="0.1" min="0.5"></div>
+      <div class="field grow"><label>切片输出目录（当前任务）</label><input id="tr_exp_show" disabled placeholder="请先挂载项目并挂载/创建任务"></div>
+    </div>
+    <button onclick="preprocess()">⚙️ 开始切分（切片音频写入 工作区/项目/任务/exp/0_gt_wavs + 1_16k_wavs）</button>
+    <div id="tr_result"></div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">②</span>特征提取（F0 + HuBERT）</h2>
+    <div class="row">
+      <div class="field grow"><label>特征输出目录（当前任务）</label><input id="fe_exp_show" disabled placeholder="请先挂载项目并挂载/创建任务"></div>
+      <div class="field"><label>F0 方法</label><select id="fe_f0"><option value="rmvpe">rmvpe（推荐）</option><option value="pm">pm</option><option value="fcpe">fcpe</option></select></div>
+      <div class="field"><label>模型版本</label><select id="fe_ver"><option value="2">v2（768 维）</option><option value="1">v1（256 维）</option></select></div>
+      <div class="field"><label>　</label><button onclick="extractFeat()">🔬 开始提取（2a_f0/2b-f0nsf + 3_feature*)</button></div>
+    </div>
+    <div id="fe_result"></div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">③</span>索引训练</h2>
+    <div class="row">
+      <div class="field grow"><label>索引输出目录（当前任务）</label><input id="ti_exp_show" disabled placeholder="请先挂载项目并挂载/创建任务"></div>
+      <div class="field"><label>模型版本</label><select id="ti_ver"><option value="2">v2</option><option value="1">v1</option></select></div>
+      <div class="field"><label>　</label><button onclick="trainIndex()">📇 开始构建索引（added_IVF*_v{ver}.npz）</button></div>
+    </div>
+    <div id="ti_result"></div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">⛏</span>④ 训练（含方案二：多级最优筛选）</h2>
+    <div class="row">
+      <div class="field grow"><label>训练数据目录（当前任务 exp）</label><input id="tr_exp_show2" disabled placeholder="请先挂载项目并挂载/创建任务"></div>
+      <div class="field"><label>模型输出目录（任务 checkpoints）</label><input id="tr_ckpt_show" disabled placeholder="请先挂载任务"></div>
+      <div class="field"><label>训练轮数（每轮=全部样本一遍；数据集越大建议轮数越少）</label><input id="tr_epochs" type="number" value="50"></div>
+      <div class="field"><label>每 N 步保存（50 轮≈6000 步，建议 500~1000）</label><input id="tr_save" type="number" value="500"></div>
+      <div class="field"><label>续训 resume_state.npz 路径（空=从头）</label><input id="tr_resume" placeholder="可选"></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>方案二开关</label><select id="tr_smart"><option value="0">关闭（传统保存）</option><option value="1">开启（段最优+全局最最优）</option></select></div>
+      <div class="field"><label>每段保存周期数（epoch_segment）</label><input id="tr_seg" type="number" value="10"></div>
+      <div class="field"><label>内存中模型数上限</label><input id="tr_maxm" type="number" value="8"></div>
+      <div class="field"><label>　</label><button onclick="startTrain()">⛏ 开始训练</button></div>
+      <div class="field"><label>推理版本</label><select id="tr_se_ver"><option value="v2">v2</option><option value="v1">v1</option></select></div>
+      <div class="field"><label>　</label><button class="ghost" onclick="ckptSavee()">⚙ 生成推理模型（最新 G_*.npz → 任务 out/）</button></div>
+      <div class="field"><label>　</label><button class="ghost" onclick="saveSmartToProject()">💾 保存方案二到当前项目</button></div>
+    </div>
+    <div id="tr_train_result"></div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">▤</span>训练日志（实时）</h2>
+    <div class="console" id="trainLog"><span class="log-line t-err">— 切分/特征/索引的实时日志将显示在这里 —</span></div>
+  </div>
+</div>
+
+<!-- ================= 模型工具 ================= -->
+<div class="page" id="p-tools">
+  <div class="card">
+    <h2><span class="step">▶</span>模型融合（音色混合）</h2>
+    <div class="row">
+      <div class="field"><label>模型 A</label><select id="mg_a"></select></div>
+      <div class="field"><label>模型 B</label><select id="mg_b"></select></div>
+      <div class="slider-wrap"><label>A 权重（0 ~ 1）</label>
+        <input type="range" id="mg_alpha" min="0" max="1" value="0.5" step="0.05">
+        <span class="sval" id="mg_alphaVal">0.50</span></div>
+      <div class="field"><label>输出名（可选，写 models/）</label><input id="mg_name" type="text" placeholder="my_mix"></div>
+    </div>
+    <button onclick="mergeModels()">🔀 融合模型（输出到根目录 models/）</button>
+    <div id="mg_result"></div>
+  </div>
+  <div class="card">
+    <h2>模型工具 · 提取小模型（底模/大模型 → 推理 .pth）</h2>
+    <div class="row">
+      <div class="field"><label>源模型</label><select id="ce_model"></select></div>
+      <div class="field"><label>采样率</label><select id="ce_sr"><option value="48000">48k</option><option value="40000">40k</option><option value="32000">32k</option></select></div>
+      <div class="field"><label>音高引导</label><select id="ce_f0"><option value="1">f0（推荐）</option><option value="0">无 f0</option></select></div>
+      <div class="field"><label>版本</label><select id="ce_ver"><option value="v2">v2</option><option value="v1">v1</option></select></div>
+      <div class="field"><label>输出名（可选）</label><input id="ce_name" placeholder="my_small"></div>
+      <div class="field"><label>　</label><button onclick="ckptExtract()">⚙ 提取</button></div>
+    </div>
+    <div id="ce_result"></div>
+  </div>
+  <div class="card">
+    <h2><span class="step">ℹ</span>后端信息</h2>
+    <div id="tools_status" class="subtitle">加载中…</div>
+    <div id="tools_detail"></div>
+  </div>
+</div>
+
+<!-- ================= 文件管理（models/ 目录） ================= -->
+<div class="page" id="p-files">
+  <div class="card">
+    <h2><span class="step">▶</span>成品模型（根目录 models/）</h2>
+    <p class="subtitle">成品模型放项目根目录 <code>models/</code>（英文文件夹），索引在 <code>models/indices/</code>；
+      支持真实删除与下载。</p>
+    <table class="files">
+      <thead><tr><th>文件名</th><th>类型</th><th>大小</th><th>操作</th></tr></thead>
+      <tbody id="filesModelBody"><tr><td colspan="4" style="color:var(--muted)">加载中…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2><span class="step">▶</span>检索索引（models/indices/）</h2>
+    <table class="files">
+      <thead><tr><th>文件名</th><th>类型</th><th>大小</th><th>操作</th></tr></thead>
+      <tbody id="filesIndexBody"><tr><td colspan="4" style="color:var(--muted)">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ================= 关于 / 声明 ================= -->
+<div class="page" id="p-about">
+  <div class="card">
+    <h2>关于本项目</h2>
+    <p><b>RVC-Vulkan</b> 是基于 <a href="https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI" target="_blank">RVC-Project / Retrieval-based-Voice-Conversion-WebUI</a>
+    的<b>第三方个人移植项目</b>：将原版深度依赖 CUDA/PyTorch 的实现，完整重写为
+    纯 numpy + 原生 Vulkan 计算后端，运行时不依赖 torch/transformers/faiss/librosa。</p>
+    <ul>
+      <li><b>界面布局</b>：对齐原版 RVC 网页的分区与交互（模型推理 / 训练 / 模型工具），为独立重写实现（非官方代码）；</li>
+      <li><b>模型兼容</b>：可直接加载原版训练/推理 .pth（推理格式与训练底模格式均支持）；</li>
+      <li><b>索引兼容</b>：可读取原版 faiss .index（IndexFlat/IVFFlat/IDMap）；本项目自建 .npz/.ivf.npz 索引；</li>
+      <li><b>后端</b>：Vulkan（AMD/Intel/NVIDIA 驱动）可用则用，否则自动回退 CPU numpy。</li>
+    </ul>
+    <div id="about_status"></div>
+  </div>
+</div>
+
+<footer>
+  RVC-Vulkan · 第三方个人项目，与原版 <b>RVC-Project/Retrieval-based-Voice-Conversion-WebUI</b>
+  无官方从属关系 · 原版版权归 RVC-Project 及其贡献者所有<br>
+  本项目为学习与研究用途的开源移植，使用前请遵守原项目及其依赖的许可协议
+</footer>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let MODELS=[];
+let LAST_BATCH=null; // 最近一次批量变声的参数（供打包 zip 复用）
+
+/* ================= 通用 ================= */
+async function api(url, fd){
+  const res=await fetch(url,{method:'POST',body:fd});
+  const j=await res.json().catch(()=>({}));
+  if(!res.ok){
+    let msg=j.detail||j.error||j.message||('HTTP '+res.status);
+    if(typeof msg!=='string'){try{msg=JSON.stringify(msg);}catch(err){msg=String(msg);}}
+    throw new Error(String(msg).slice(0,500));
+  }
+  return j;
+}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+/* 滑块：range + 右侧当前值徽标 */
+function bindSlider(id,fmt){
+  const el=$(id),val=$(id+'Val');
+  const upd=()=>{val.textContent=fmt(parseFloat(el.value));};
+  el.addEventListener('input',upd);upd();
+  return el;
+}
+bindSlider('spk',v=>v);
+bindSlider('pitch',v=>(v>0?'+':'')+v);
+bindSlider('slice',v=>v<=0?'自动':v+'s');
+bindSlider('idxr',v=>v.toFixed(2));
+bindSlider('brmix',v=>v.toFixed(2));
+bindSlider('prot',v=>v.toFixed(2));
+bindSlider('clmix',v=>v.toFixed(2)+(+v>=1?'（清晰）':(+v<=0?'（口齿不清）':'（混合）')));
+bindSlider('rms',v=>v.toFixed(2));
+bindSlider('resr',v=>v<=0?'0（原生）':(v/1000).toFixed(0)+'k');
+bindSlider('mg_alpha',v=>v.toFixed(2));
+
+/* ================= 初始化 ================= */
+async function init(){
+  try{const h=await fetch('/health').then(r=>r.json());
+    $('health').textContent='后端: '+(h.device||'?');}
+  catch(e){$('health').textContent='后端不可用';}
+  try{await loadThemes();}catch(e){}
+  await refreshModels();refreshFiles();refreshTools();refreshProjects();
+}
+async function loadThemes(){
+  const t=await fetch('/themes').then(r=>r.json()).catch(()=>({themes:['default']}));
+  const sel=$('themeSel');
+  sel.innerHTML=(t.themes||['default']).map(x=>`<option value="${x}">主题：${x}</option>`).join('');
+  sel.onchange=()=>{document.documentElement.dataset.theme=sel.value;
+    let link=document.getElementById('themeExtra');if(!link){link=document.createElement('link');link.id='themeExtra';link.rel='stylesheet';document.head.appendChild(link);}
+    link.href=sel.value==='default'?'':`/themes/${sel.value}/theme.css`;};
+}
+
+/* ================= 模型 / 索引 ================= */
+async function refreshModels(){
+  try{
+    MODELS=await fetch('/models').then(r=>r.json()).then(j=>j.models);
+    const cur=$('model').value;
+    $('model').innerHTML=MODELS.map(m=>`<option value="${esc(m.name)}">${esc(m.name)}</option>`).join('')||'<option value="">（未找到模型）</option>';
+    if(cur&&MODELS.some(m=>m.name===cur))$('model').value=cur;
+    fillMergeSelects();await refreshIndexList();await onModelChange();
+  }catch(e){$('model').innerHTML='<option value="">模型列表加载失败</option>';}
+}
+async function refreshIndexList(){
+  const idxSel=$('idx');const keep=idxSel.value;
+  let opts='<option value="">自动匹配（推荐）</option><option value="__none__">不使用索引</option>';
+  try{
+    const j=await fetch('/files').then(r=>r.json());
+    (j.indices||[]).forEach(i=>{opts+=`<option value="${esc(i.path)}">${esc(i.name)}（${esc(i.root)}）</option>`;});
+  }catch(e){}
+  idxSel.innerHTML=opts;
+  if(keep&&[...idxSel.options].some(o=>o.value===keep))idxSel.value=keep;
+}
+async function onModelChange(){
+  await loadSpeakers();checkIndex();
+}
+async function loadSpeakers(){
+  const el=$('spk');
+  try{
+    const s=await fetch('/speakers?model='+encodeURIComponent($('model').value)).then(r=>r.json());
+    const max=Math.max(0,(s.speaker_count||1)-1);
+    el.max=max;if(parseInt(el.value)>max)el.value=max;
+    $('spkVal').textContent=el.value;
+  }catch(e){el.max=0;el.value=0;$('spkVal').textContent='0';}
+}
+async function checkIndex(){
+  const st=$('idxStatus');const model=$('model').value;
+  if(!model){st.textContent='—';return;}
+  st.textContent='检查索引…';
+  try{
+    const j=await fetch('/index_for_model?model='+encodeURIComponent(model)+'&speaker_id='+(+$('spk').value||0)).then(r=>r.json());
+    if(j.index){const name=decodeURIComponent(j.index.split(/[\\/]/).pop()||j.index);
+      st.innerHTML='<span class="ok">✓ 已自动识别索引：<code>'+esc(name)+'</code></span>';}
+    else{st.innerHTML='<span class="warn">未找到匹配索引：可下拉选择，或把索引率设为 0</span>';}
+  }catch(e){st.innerHTML='<span class="err">索引检查失败</span>';}
+}
+function idxChanged(){
+  if($('idx').value==='__none__')$('idxStatus').innerHTML='<span class="warn">已选择"不使用索引"（等效索引率=0）</span>';
+  else checkIndex();
+}
+function fillMergeSelects(){
+  const o=MODELS.map(m=>`<option value="${esc(m.name)}">${esc(m.name)}</option>`).join('');
+  $('mg_a').innerHTML=o;$('mg_b').innerHTML=o;
+  const ce=$('ce_model');if(ce){ce.innerHTML=o;}
+}
+async function ckptExtract(){
+  $('ce_result').innerHTML='<div class="ok">提取中…</div>';
+  const fd=new FormData();
+  fd.append('model',$('ce_model').value);
+  fd.append('sr',+$('ce_sr').value||48000);
+  fd.append('if_f0',+$('ce_f0').value||1);
+  fd.append('version',$('ce_ver').value);
+  fd.append('name',$('ce_name').value.trim());
+  try{const j=await api('/ckpt_extract',fd);
+    $('ce_result').innerHTML='<div class="ok">✅ 已生成：'+esc(j.output)+'</div>';
+    await refreshModels();}
+  catch(e){$('ce_result').innerHTML='<div class="err">❌ '+esc(e.message)+'</div>';}
+}
+
+/* ================= 实时日志（轮询 1s）+ 进度解析 ================= */
+const LOGS={infer:{pos:0,on:false},train:{pos:0,on:false}};
+let pollTimer=null;
+
+function startLogPolling(){
+  if(pollTimer)return;
+  pollTimer=setInterval(async()=>{
+    await Promise.all([pollLog('infer'),pollLog('train')]);
+  },1000);
+}
+async function pollLog(which){
+  const el=$(which==='infer'?'inferLog':'trainLog');
+  if(!el)return;
+  try{
+    const j=await fetch('/logs?since='+LOGS[which].pos).then(r=>r.json());
+    if(j.lines&&j.lines.length){
+      LOGS[which].pos=j.pos;
+      const frag=document.createDocumentFragment();
+      j.lines.forEach(line=>{
+        const span=document.createElement('span');
+        span.className='log-line '+classify(line);
+        span.textContent=line;
+        frag.appendChild(span);
+        handleProgress(which,line);
+      });
+      el.appendChild(frag);
+      el.scrollTop=el.scrollHeight;
+      if(el.children.length>800){ // 防爆：裁剪历史行
+        while(el.children.length>600)el.removeChild(el.firstChild);
+      }
+    }
+  }catch(e){}
+}
+function classify(line){
+  if(/^进度:/.test(line))return 't-progress';
+  if(/^批量:/.test(line))return 't-batch';
+  if(/失败|错误|Error|Traceback|error/.test(line))return 't-err';
+  return '';
+}
+function handleProgress(which,line){
+  let m=line.match(/^进度: (\d+)\/(\d+)/);
+  if(m&&which==='infer'){setProg('infer',+m[1],+m[2]);return;}
+  m=line.match(/^批量: 文件 (\d+)\/(\d+)/);
+  if(m&&which==='infer'){setProg('batch',+m[1],+m[2]);return;}
+  m=line.match(/^批量: 完成 (\d+)\/(\d+)/);
+  if(m&&which==='infer'){setProg('batch',+m[1],+m[2]);return;}
+}
+function setProg(which,done,total){
+  const pct=total>0?Math.round(done/total*100):0;
+  $((which==='infer'?'infer':'batch')+'Fill').style.width=pct+'%';
+  $((which==='infer'?'infer':'batch')+'Pct').innerHTML='<b>'+pct+'%</b>（'+done+'/'+total+'）';
+  $(which==='infer'?'inferProg':'batchProg').classList.add('show');
+}
+function showProg(id,show){$(id).classList.toggle('show',show);}
+function clearLog(which){
+  $(which==='infer'?'inferLog':'trainLog').innerHTML='';
+  LOGS[which].pos=0; // 从头拉取（环形缓冲被截断时也能显示）
+}
+function logLine(which,line){ // 本地即时回显（请求失败等场景）
+  const el=$(which==='infer'?'inferLog':'trainLog');
+  const span=document.createElement('span');
+  span.className='log-line '+classify(line);span.textContent=line;
+  el.appendChild(span);el.scrollTop=el.scrollHeight;
+}
+
+/* ================= 推理（单文件） ================= */
+function previewAudio(){
+  const f=$('audio').files[0];
+  if(!f)return;
+  const url=URL.createObjectURL(f);
+  const box=$('previewBox');
+  box.style.display='block';
+  $('preview').src=url;
+  $('preview').load();
+}
+async function convert(){
+  const f=$('audio').files[0];if(!f){alert('请选择音频文件');return;}
+  if(!$('model').value){alert('请选择模型');return;}
+  $('result').innerHTML='';
+  showProg('inferProg',true);setProg('infer',0,1);
+  $('go').disabled=true;
+  clearLog('infer');logLine('infer','推理: 开始（模型='+$('model').value+'）');
+  const fd=new FormData();
+  fd.append('audio',f);fd.append('model',$('model').value);
+  fd.append('speaker_id',+$('spk').value||0);fd.append('pitch',+$('pitch').value||0);
+  fd.append('f0_method',$('f0').value);
+  const idx=$('idx').value;
+  fd.append('index',idx==='__none__'?'':idx);
+  fd.append('index_rate',idx==='__none__'?0:(+$('idxr').value||0));
+  fd.append('retrieval_mode',$('rmode').value);
+  fd.append('brute_mix',+$('brmix').value||0);
+  fd.append('protect',+$('prot').value||0);
+  fd.append('clarity_mix',+$('clmix').value<0?0:(+$('clmix').value>1?1:+$('clmix').value||1));
+  fd.append('rms_mix_rate',+$('rms').value||0);
+  fd.append('resample_sr',+$('resr').value||0);
+  fd.append('slice_length',+$('slice').value||0);
+  try{
+    // "Failed to fetch" 根治 v2：后端已将结果落盘到 输出/ 目录并返回 JSON
+    // （含文件 URL）。前端只需拿到小 JSON；即使主请求连接抖动，重试换新
+    // 连接拿 JSON，结果文件已在磁盘——永不丢结果。
+    let res=null, lastErr=null;
+    for(let attempt=0; attempt<3; attempt++){
+      try{
+        res=await fetch('/infer',{method:'POST',body:fd,keepalive:true});
+        break; // 成功
+      }catch(e){
+        lastErr=e;
+        if(attempt<2)await new Promise(r=>setTimeout(r,800*(attempt+1))); // 0.8s/1.6s 退避
+      }
+    }
+    if(!res)throw lastErr||new Error('网络请求失败');
+    if(!res.ok){const t=await res.text();throw new Error(t.slice(0,300)||('HTTP '+res.status));}
+    const j=await res.json();
+    setProg('infer',1,1);
+    if(j.status!=='ok')throw new Error(j.error||'推理失败');
+    $('result').innerHTML=`<div class="ok">✅ 转换成功（${(j.bytes/1024).toFixed(0)} KB）— 已保存到 输出/${esc(j.file)}</div>
+      <audio controls src="${esc(j.url)}"></audio>
+      <a class="dl" href="${esc(j.url)}" download="${esc(j.file)}">⬇ 下载 wav</a>`;
+  }catch(e){
+    $('result').innerHTML=`<div class="err">❌ 转换失败：${esc(e.message)}</div>`;
+    logLine('infer','推理: 失败 '+e.message);
+  }
+  finally{$('go').disabled=false;}
+}
+
+/* ================= 批量变声 + zip 导出 ================= */
+function collectBatchParams(exportMode){
+  const fd=new FormData();
+  const files=$('batchFiles').files;
+  for(const f of files)fd.append('files',f);
+  fd.append('in_dir',$('batchInDir').value.trim());
+  fd.append('out_dir',$('batchOutDir').value.trim());
+  fd.append('model',$('model').value);
+  fd.append('speaker_id',+$('spk').value||0);fd.append('pitch',+$('pitch').value||0);
+  fd.append('f0_method',$('f0').value);
+  const idx=$('idx').value;
+  fd.append('index',idx==='__none__'?'':idx);
+  fd.append('index_rate',idx==='__none__'?0:(+$('idxr').value||0));
+  fd.append('retrieval_mode',$('rmode').value);
+  fd.append('brute_mix',+$('brmix').value||0);
+  fd.append('protect',+$('prot').value||0);
+  fd.append('clarity_mix',+$('clmix').value<0?0:(+$('clmix').value>1?1:+$('clmix').value||1));
+  fd.append('rms_mix_rate',+$('rms').value||0);
+  fd.append('resample_sr',+$('resr').value||0);
+  fd.append('slice_length',+$('slice').value||0);
+  if(exportMode)fd.append('export','zip');
+  return fd;
+}
+async function batchGo(){
+  if(!$('model').value){alert('请选择模型');return;}
+  const files=$('batchFiles').files;
+  const inDir=$('batchInDir').value.trim();
+  if(!files.length&&!inDir){alert('请选择音频文件或填写服务器目录 in_dir');return;}
+  $('batchResult').innerHTML='';
+  showProg('batchProg',true);setProg('batch',0,1);
+  $('batchGo').disabled=true;$('batchZipBtn').disabled=true;
+  clearLog('infer');logLine('infer','批量: 开始（文件='+files.length+'，in_dir='+(inDir||'—')+'）');
+  const fd=collectBatchParams(false);
+  try{
+    const j=await api('/batch',fd);
+    LAST_BATCH={files:Array.from(files),inDir};
+    const rows=(j.results||[]).map(r=>
+      `<tr><td>${esc(r.name)}</td><td class="${r.ok?'ok-ico':'no-ico'}">${r.ok?'✓ 成功':'✗ 失败'}</td>
+       <td>${r.ok?esc(r.out_file||''):''}</td><td style="color:var(--err);font-size:12px">${esc(r.error||'')}</td></tr>`).join('');
+    $('batchResult').innerHTML=`<div class="ok">✅ 批量完成 ${j.results.filter(r=>r.ok).length}/${j.total||j.results.length}</div>
+      <table class="files"><thead><tr><th>文件名</th><th>状态</th><th>输出</th><th>错误</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="warn" style="margin-top:6px">💡 点下方"打包下载 zip"可把全部成功结果打包下载。</div>`;
+    setProg('batch',j.results.filter(r=>r.ok).length,j.results.length);
+    $('batchZipBtn').disabled=false;
+  }catch(e){
+    $('batchResult').innerHTML=`<div class="err">❌ 批量失败：${esc(e.message)}</div>`;
+    logLine('infer','批量: 失败 '+e.message);
+  }finally{$('batchGo').disabled=false;}
+}
+async function batchZip(){
+  const fd=collectBatchParams(true);
+  $('batchZipBtn').disabled=true;
+  logLine('infer','批量: 打包 zip 中…');
+  try{
+    const res=await fetch('/batch',{method:'POST',body:fd});
+    if(!res.ok){const t=await res.text();throw new Error(t.slice(0,300)||('HTTP '+res.status));}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='rvc_batch.zip';
+    document.body.appendChild(a);a.click();a.remove();
+    logLine('infer','批量: zip 打包完成（'+ (blob.size/1024).toFixed(0) +' KB）');
+  }catch(e){
+    $('batchResult').insertAdjacentHTML('beforeend',`<div class="err">❌ 打包失败：${esc(e.message)}</div>`);
+    logLine('infer','批量: 打包失败 '+e.message);
+  }finally{$('batchZipBtn').disabled=false;}
+}
+
+/* ================= 训练 ================= */
+function _requireTask(){
+  if(!_currentProject){alert('请先挂载项目（选择项目→挂载项目）');return null;}
+  if(!_currentTask){alert('请先挂载/创建任务：有任务时用「挂载任务」下拉选择，无任务时输入新任务名→「新建任务」');return null;}
+  return {project:_currentProject,task:_currentTask};
+}
+function _taskExpShow(){
+  const ok=_currentProject&&_currentTask;
+  return ok?('workspaces/'+_currentProject+'/'+_currentTask+'/exp'):'（请先挂载项目并挂载/创建任务）';
+}
+function updateTaskBar(){
+  const exp=_taskExpShow();
+  ['tr_exp_show','fe_exp_show','ti_exp_show','tr_exp_show2'].forEach(id=>{const el=$(id);if(el)el.value=exp;});
+  const ck=$('tr_ckpt_show');
+  if(ck)ck.value=(_currentProject&&_currentTask)?('workspaces/'+_currentProject+'/'+_currentTask+'/checkpoints'):'（请先挂载任务）';
+  if(_currentProject){
+    $('projInfo').innerHTML='<span class="ok">✅ 已挂载项目 <code>'+esc(_currentProject)+'</code>'
+      +(_currentTask?(' → 当前任务 <code>'+esc(_currentTask)+'</code>，产物目录 <code>'+esc(exp)+'</code>'):'')
+      +'</span>';
+  }
+}
+async function preprocess(){
+  const t=_requireTask();if(!t)return;
+  $('tr_result').innerHTML='<div class="ok">切分启动…</div>';
+  clearLog('train');logLine('train','预处理: 开始');
+  const fd=new FormData();
+  fd.append('inp_root',$('tr_inp').value.trim());
+  fd.append('project',t.project);fd.append('task',t.task);
+  fd.append('sr',+$('tr_sr').value||48000);fd.append('per',+$('tr_per').value||3.7);
+  try{const j=await api('/preprocess',fd);
+    $('tr_result').innerHTML='<div class="ok">✅ 切片完成：'+esc(j.exp_dir)+'</div>';}
+  catch(e){$('tr_result').innerHTML='<div class="err">❌ '+esc(e.message)+'</div>';}
+}
+async function extractFeat(){
+  const t=_requireTask();if(!t)return;
+  $('fe_result').innerHTML='<div class="ok">特征提取中…（f0 + hubert，较慢）</div>';
+  clearLog('train');logLine('train','特征提取: 开始');
+  const fd=new FormData();
+  fd.append('project',t.project);fd.append('task',t.task);
+  fd.append('f0_method',$('fe_f0').value);fd.append('version',+$('fe_ver').value);
+  try{const j=await api('/extract_features',fd);
+    $('fe_result').innerHTML=`<div class="ok">✅ F0: ${esc(JSON.stringify(j.f0))}<br>HuBERT: ${esc(JSON.stringify(j.hubert))}</div>`;}
+  catch(e){$('fe_result').innerHTML='<div class="err">❌ '+esc(e.message)+'</div>';}
+}
+async function trainIndex(){
+  const t=_requireTask();if(!t)return;
+  $('ti_result').innerHTML='<div class="ok">索引构建中…</div>';
+  clearLog('train');logLine('train','索引构建: 开始');
+  const fd=new FormData();
+  fd.append('project',t.project);fd.append('task',t.task);fd.append('version',+$('ti_ver').value);
+  try{const j=await api('/train_index',fd);
+    $('ti_result').innerHTML='<div class="ok">✅ 索引：'+esc(j.index)+'</div>';}
+  catch(e){$('ti_result').innerHTML='<div class="err">❌ '+esc(e.message)+'</div>';}
+}
+
+// ---- 训练工作区（项目 + 任务挂载） ----
+async function refreshProjects(){
+  try{const j=await fetch('/projects').then(r=>r.json());
+    const sel=$('projList');
+    sel.innerHTML=(j.projects&&j.projects.length)?j.projects.map(p=>`<option value="${p}">${p}</option>`).join(''):'<option value="">（暂无项目）</option>';
+    if(_currentProject&&j.projects&&j.projects.indexOf(_currentProject)<0){_currentProject=null;_currentTask=null;}
+  }catch(e){$('projInfo').innerHTML='<span class="err">项目列表获取失败</span>';}
+}
+async function newProject(){
+  const n=$('projName').value.trim();if(!n){alert('请输入项目名（中文）');return;}
+  $('projInfo').innerHTML='<span class="ok">创建中…</span>';
+  const fd=new FormData();fd.append('name',n);fd.append('mode',$('projMode').value);
+  fd.append('sample_rate',+$('projSr').value||48000);
+  try{const j=await api('/projects',fd);
+    _currentProject=n;_currentTask=null;
+    $('projName').value='';
+    await refreshProjects();await refreshTasks();updateTaskBar();
+    if(!Object.keys(j.tasks||{}).length){
+      $('projInfo').innerHTML='<span class="ok">✅ 项目已建：<code>'+esc(n)+'</code>（尚无任务）→ 输入新任务名（中文）点击「新建任务」即可开始。</span>';
+    }}
+  catch(e){$('projInfo').innerHTML='<span class="err">❌ '+esc(e.message)+'</span>';}
+}
+let _currentProject=null,_currentTask=null;
+async function loadProject(){
+  const n=$('projList').value;if(!n){alert('请先选择项目');return;}
+  try{const j=await fetch('/projects/'+encodeURIComponent(n)).then(r=>r.json());
+    if(j.detail)throw new Error(j.detail);
+    _currentProject=n;_currentTask=null;
+    const t=j.training||{};const sp=j.smart_sampling||{};
+    const sm=$('tr_smart'),sg=$('tr_seg'),smx=$('tr_maxm');
+    if(sm){sm.value=sp.enabled?'1':'0';}
+    if(sg){sg.value=sp.epoch_segment||10;}
+    if(smx){smx.value=sp.max_models_in_memory||8;}
+    const psr=$('projSr');if(psr&&(t.data||{}).sample_rate){psr.value=String((t.data||{}).sample_rate);}
+    await refreshTasks();
+    const ts=Object.keys(j.tasks||{});
+    if(ts.length){
+      _currentTask=ts[0];
+      $('projInfo').innerHTML='<span class="ok">✅ 已挂载项目 <code>'+esc(n)+'</code>，检测到 '+ts.length+' 个任务：'
+        +esc(ts.join('、'))+'——用「挂载任务」下拉切换；已自动选中 <code>'+esc(ts[0])+'</code>。</span>';
+    }else{
+      $('projInfo').innerHTML='<span class="ok">✅ 已挂载项目 <code>'+esc(n)+'</code>（尚无任务）→ 输入新任务名（中文）点击「新建任务」即可开始。</span>';
+    }
+    updateTaskBar();
+  }catch(e){$('projInfo').innerHTML='<span class="err">❌ '+esc(e.message)+'</span>';}
+}
+async function refreshTasks(){
+  const sel=$('taskSel');if(!sel)return;
+  if(!_currentProject){sel.innerHTML='<option value="">（请先挂载项目）</option>';return;}
+  try{const j=await fetch('/projects/'+encodeURIComponent(_currentProject)).then(r=>r.json());
+    const ts=Object.keys(j.tasks||{});
+    sel.innerHTML=ts.length?ts.map(t=>`<option value="${t}">${t}</option>`).join(''):'<option value="">（该项目暂无任务，请新建）</option>';
+    if(_currentTask&&ts.indexOf(_currentTask)<0)_currentTask=null;
+  }catch(e){sel.innerHTML='<option value="">（任务读取失败）</option>';}
+}
+async function mountTask(){
+  const t=$('taskSel').value;
+  if(!_currentProject){alert('请先挂载项目（选择项目→挂载项目）');return;}
+  if(!t){alert('该项目暂无任务：输入新任务名（中文）点击「新建任务」创建后会自动挂载');return;}
+  _currentTask=t;updateTaskBar();
+  $('projInfo').innerHTML='<span class="ok">✅ 已挂载任务 <code>'+esc(t)+'</code>（项目 <code>'+esc(_currentProject)+'</code>）</span>';
+}
+async function newTask(){
+  if(!_currentProject){alert('请先挂载项目（选择项目→挂载项目）');return;}
+  const tag=$('taskTag').value.trim();if(!tag){alert('请输入任务名（中文，如：大肥鱼1）');return;}
+  const fd=new FormData();fd.append('task_tag',tag);fd.append('speaker_ids','0');
+  try{const j=await api('/projects/'+encodeURIComponent(_currentProject)+'/tasks',fd);
+    _currentTask=tag;await refreshTasks();updateTaskBar();
+    $('taskTag').value='';
+    $('projInfo').innerHTML='<span class="ok">✅ 任务已建并自动挂载：<code>'+esc(tag)+'</code> → '+esc(j.exp_dir)+'</span>';}
+  catch(e){$('projInfo').innerHTML='<span class="err">❌ '+esc(e.message)+'</span>';}
+}
+
+async function saveSmartToProject(){
+  if(!_currentProject){alert('请先挂载项目（选择项目→挂载项目）');return;}
+  const payload=JSON.stringify({
+    enabled:$('tr_smart').value==='1',
+    epoch_segment:+$('tr_seg').value||10,
+    max_models_in_memory:+$('tr_maxm').value||8});
+  const fd=new FormData();
+  fd.append('section','smart_sampling');fd.append('payload',payload);
+  try{const j=await api('/projects/'+encodeURIComponent(_currentProject)+'/config',fd);
+    $('projInfo').innerHTML='<span class="ok">✅ 方案二配置已保存到项目 <code>'+esc(_currentProject)+'</code></span>';
+  }catch(e){$('projInfo').innerHTML='<span class="err">❌ '+esc(e.message)+'</span>';}
+}
+async function startTrain(){
+  const t=_requireTask();if(!t)return;
+  clearLog('train');logLine('train','训练: 启动请求…');
+  const fd=new FormData();
+  fd.append('project',t.project);fd.append('task',t.task);
+  fd.append('epochs',+$('tr_epochs').value||0);
+  fd.append('steps',0);
+  fd.append('save_every',+$('tr_save').value||500);
+  fd.append('resume',$('tr_resume').value.trim());
+  if($('tr_smart').value==='1'){
+    fd.append('smart_json',JSON.stringify({
+      enabled:true, epoch_segment:+$('tr_seg').value||10,
+      max_models_in_memory:+$('tr_maxm').value||8,
+      keep_segment_best:true, keep_global_best:true}));
+  }
+  $('tr_train_result').innerHTML='<div class="ok">训练已提交（后台运行，见下方实时日志与进度）</div>';
+  try{const j=await api('/train',fd);
+    $('tr_train_result').innerHTML='<div class="ok">✅ 训练启动：<code>'+esc('workspaces/'+t.project+'/'+t.task+'/exp')+'</code>（'+(j.running?'运行中':'已结束')+'）</div>';
+    pollTrainStatus();}
+  catch(e){$('tr_train_result').innerHTML='<div class="err">❌ '+esc(e.message)+'</div>';}
+}
+async function pollTrainStatus(){
+  try{const j=await fetch('/train_status').then(r=>r.json());
+    const el=$('tr_train_result');
+    if(el) el.innerHTML='<div class="ok">训练'+(j.running?'运行中':'已结束/未运行')+'（任务：'+esc(j.task||'—')+'）</div>';
+  }catch(e){}
+}
+async function ckptSavee(){
+  const t=_requireTask();if(!t)return;
+  $('tr_train_result').innerHTML='<div class="ok">生成推理模型…（最新 G_*.npz → 任务 out/）</div>';
+  const fd=new FormData();
+  fd.append('project',t.project);fd.append('task',t.task);
+  fd.append('sr',48000);fd.append('if_f0',1);fd.append('version',$('tr_se_ver').value);
+  try{const j=await api('/ckpt_savee',fd);
+    $('tr_train_result').innerHTML='<div class="ok">✅ 推理模型已生成：<code>'+esc(j.output)+'</code></div>';
+    if(window.refreshModels)await refreshModels();
+    if(window.refreshFiles)await refreshFiles();}
+  catch(e){$('tr_train_result').innerHTML='<div class="err">❌ '+esc(e.message)+'</div>';}
+}
+
+/* ================= 模型工具 ================= */
+async function mergeModels(){
+  $('mg_result').innerHTML='<div class="ok">融合中…</div>';
+  const fd=new FormData();
+  fd.append('model1',$('mg_a').value);fd.append('model2',$('mg_b').value);
+  fd.append('alpha1',+$('mg_alpha').value||0.5);fd.append('name',$('mg_name').value.trim());
+  try{const j=await api('/merge',fd);
+    $('mg_result').innerHTML='<div class="ok">✅ 融合成功：'+esc(j.output)+'</div>';
+    await refreshModels();refreshFiles();}
+  catch(e){$('mg_result').innerHTML='<div class="err">❌ '+esc(e.message)+'</div>';}
+}
+async function refreshTools(){
+  try{const h=await fetch('/health').then(r=>r.json());
+    $('tools_status').textContent='计算后端：'+(h.backend||'—')+'｜设备：'+(h.device||'—');
+  }catch(e){$('tools_status').textContent='后端不可用';}
+}
+
+/* ================= 文件管理（models/） ================= */
+const MARKED={};
+async function refreshFiles(){
+  try{
+    const j=await fetch('/files').then(r=>r.json());
+    $('filesModelBody').innerHTML=renderFileRows(j.models||[]);
+    $('filesIndexBody').innerHTML=renderFileRows(j.indices||[]);
+  }catch(e){
+    $('filesModelBody').innerHTML='<tr><td colspan="4" class="err">加载失败</td></tr>';
+  }
+}
+function renderFileRows(items){
+  if(!items.length)return '<tr><td colspan="4" style="color:var(--muted)">（空，无文件）</td></tr>';
+  return items.map(it=>{
+    const name=esc(it.name);
+    const path=esc(it.path).replace(/'/g,"\\'");
+    return `<tr><td>${name}</td>
+      <td>${it.kind==='model'?'🎵 模型':'🗂 索引'}</td>
+      <td>${esc(it.size_h)}</td>
+      <td style="white-space:nowrap">
+        <button class="ghost" onclick="downloadFile('${path}')">⬇ 下载</button>
+        <button class="btn-del" onclick="delFile('${path}','${name}')">🗑 删除</button>
+      </td></tr>`;
+  }).join('');
+}
+function downloadFile(path){
+  const a=document.createElement('a');
+  a.href='/files/download?path='+encodeURIComponent(path);
+  a.download='';document.body.appendChild(a);a.click();a.remove();
+}
+async function delFile(path,name){
+  if(!confirm('确定删除文件「'+name+'」？此操作不可恢复。'))return;
+  try{const j=await api('/files/delete',(()=>{const f=new FormData();f.append('path',path);return f;})());
+    refreshFiles();
+    logLine('train','文件管理: 已删除 '+name);
+  }catch(e){alert('删除失败：'+e.message);}
+}
+function toggleMark(path){
+  MARKED[path]=!MARKED[path];
+  refreshFiles();
+}
+
+/* ================= Tab ================= */
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('show'));
+  t.classList.add('active');document.getElementById('p-'+t.dataset.p).classList.add('show');
+  if(t.dataset.p==='about')loadAbout();
+  if(t.dataset.p==='files')refreshFiles();
+  if(t.dataset.p==='tools')refreshTools();
+});
+async function loadAbout(){
+  try{const h=await fetch('/health').then(r=>r.json());
+    $('about_status').innerHTML='<div class="ok" style="margin-top:10px">计算后端：'+esc(h.backend)+'｜设备：'+(h.device||'—')+'</div>';}
+  catch(e){}
+}
+
+init();startLogPolling();
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+// In-place elementwise multiply by scalar-from-buffer: a[i] *= b[0].
+// a is the in-place output (binding 0), b read-only (binding 1) — the
+// shader reads only element 0 (a 1-element scalar slot; per-step denom
+// uploads). Binding layout matches madd_const.comp.
+// T4-2 AdamW: 1-element slot for step-varying scalar (denom).
+// float4-vectorised main path (componentwise, result-identical).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BB { float b[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+} pc;
+
+void main() {
+    const float s = b[0];
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint i4 = gid * 4u;
+    if (i4 + 3u < pc.N) {
+        vec4 va = vec4(a[i4], a[i4 + 1u], a[i4 + 2u], a[i4 + 3u]);
+        va *= s;
+        a[i4] = va.x;
+        a[i4 + 1u] = va.y;
+        a[i4 + 2u] = va.z;
+        a[i4 + 3u] = va.w;
+        return;
+    }
+    for (uint i = i4; i < pc.N && i < i4 + 4u; i++) {
+        a[i] *= s;
+    }
+}

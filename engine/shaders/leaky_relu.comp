@@ -1,0 +1,35 @@
+// In-place LeakyReLU: a[i] = (a[i] >= 0) ? a[i] : slope * a[i].
+// Semantics match torch F.leaky_relu / runtime.nn.leaky_relu (which use
+// `where(x >= 0, x, slope*x)`), so x == -0.0 stays -0.0 and positive
+// values pass through bit-exact. slope is a float in the push constant
+// (second u32), N the element count (first u32).
+// P1 throughput: float4-vectorised main path (componentwise, identical).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BA { float a[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+    float slope;
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint i4 = gid * 4u;
+    if (i4 + 3u < pc.N) {
+        vec4 v = vec4(a[i4], a[i4 + 1u], a[i4 + 2u], a[i4 + 3u]);
+        vec4 s = vec4(pc.slope);
+        vec4 r = mix(v * s, v, greaterThanEqual(v, vec4(0.0)));
+        a[i4] = r.x;
+        a[i4 + 1u] = r.y;
+        a[i4 + 2u] = r.z;
+        a[i4 + 3u] = r.w;
+        return;
+    }
+    for (uint i = i4; i < pc.N && i < i4 + 4u; i++) {
+        const float v = a[i];
+        a[i] = (v >= 0.0) ? v : pc.slope * v;
+    }
+}

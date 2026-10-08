@@ -1,0 +1,61 @@
+// GELU (exact erf form), in-place: a[i] = 0.5*a[i]*(1 + erf(a[i]/sqrt(2))).
+//
+// Matches torch.nn.functional.gelu (default) and runtime/models/hubert.py's
+// gelu_erf: Abramowitz-Stegun 7.1.26 erf approximation evaluated in float32
+// (same coefficients/order as the numpy float32 version; max delta ~1e-6,
+// far below every comparison threshold).
+//
+// Flat 1D dispatch over N elements, 256 threads/workgroup (gid.x-only
+// indexing — the AMD Radeon Pro VII lane0 workaround used by conv1d.comp).
+// P1 throughput: float4-vectorised main path (componentwise, identical).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BA { float a[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+} pc;
+
+vec4 gelu4(vec4 x) {
+    const vec4 INV_SQRT2 = vec4(0.7071067811865476);
+    const vec4 u = x * INV_SQRT2;
+    const vec4 ax = abs(u);
+    const vec4 p = vec4(0.3275911);
+    const vec4 t = 1.0 / (1.0 + p * ax);
+    // A&S 7.1.26: erf ~= 1 - ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t*exp(-t)
+    vec4 poly = ((((vec4(1.061405429) * t + vec4(-1.453152027)) * t + vec4(1.421413741))
+                   * t + vec4(-0.284496736)) * t + vec4(0.254829592)) * t;
+    vec4 erfv = 1.0 - poly * exp(-ax * ax);
+    erfv = mix(erfv, -erfv, lessThan(u, vec4(0.0)));  // erf is odd
+    return 0.5 * x * (1.0 + erfv);
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint i4 = gid * 4u;
+    if (i4 + 3u < pc.n) {
+        vec4 v = vec4(a[i4], a[i4 + 1u], a[i4 + 2u], a[i4 + 3u]);
+        v = gelu4(v);
+        a[i4] = v.x;
+        a[i4 + 1u] = v.y;
+        a[i4 + 2u] = v.z;
+        a[i4 + 3u] = v.w;
+        return;
+    }
+    for (uint i = i4; i < pc.n && i < i4 + 4u; i++) {
+        const float x = a[i];
+        const float INV_SQRT2 = 0.7071067811865476;
+        const float u = x * INV_SQRT2;
+        const float ax = abs(u);
+        const float p = 0.3275911;
+        const float t = 1.0 / (1.0 + p * ax);
+        // A&S 7.1.26: erf(x) ~= 1 - ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t*exp(-x^2)
+        float poly = ((((1.061405429 * t + (-1.453152027)) * t + 1.421413741)
+                       * t + (-0.284496736)) * t + 0.254829592) * t;
+        float erfv = 1.0 - poly * exp(-ax * ax);
+        if (u < 0.0) erfv = -erfv;  // erf is odd
+        a[i] = 0.5 * x * (1.0 + erfv);
+    }
+}

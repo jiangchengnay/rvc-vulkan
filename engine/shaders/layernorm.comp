@@ -1,0 +1,83 @@
+// LayerNorm over the last dim: for each row of x[rows, cols]:
+//   mean = sum(x)/cols; var = E[(x-mean)^2] (biased); out = (x-mean)/sqrt(var+eps)*gamma + beta
+//
+// One workgroup (256 threads) per row. Naive two-pass reduce through shared
+// memory with a tree reduction; cols of any size handled by strided loops.
+// Gamma/beta are indexed per column.
+//
+// Row index = gid.y + gid.z*65535 (z-split for rows > 65535); the single-
+// call path dispatches gz=1, so those results are bit-identical to the
+// pre-split shader.
+#version 450
+
+#define RVC_NORM_TILE 256
+
+layout(local_size_x = RVC_NORM_TILE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };      // [rows, cols]
+layout(set = 0, binding = 1) readonly buffer BG { float gamma[]; };  // [cols]
+layout(set = 0, binding = 2) readonly buffer BB { float beta[]; };   // [cols]
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };     // [rows, cols]
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    float eps;
+} pc;
+
+shared float sh_sum[RVC_NORM_TILE];
+shared float sh_sq[RVC_NORM_TILE];
+shared float sh_mean;
+shared float sh_inv;
+
+void reduce2(out float r_sum, out float r_sq) {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y
+                   + gl_GlobalInvocationID.z * 65535u;
+    const uint base = row * pc.cols;
+    float s = 0.0;
+    float q = 0.0;
+    for (uint i = lid; i < pc.cols; i += RVC_NORM_TILE) {
+        const float v = x[base + i];
+        s += v;
+        q += v * v;
+    }
+    sh_sum[lid] = s;
+    sh_sq[lid] = q;
+    barrier();
+    for (uint d = RVC_NORM_TILE / 2u; d > 0u; d >>= 1u) {
+        if (lid < d) {
+            sh_sum[lid] += sh_sum[lid + d];
+            sh_sq[lid] += sh_sq[lid + d];
+        }
+        barrier();
+    }
+    r_sum = sh_sum[0];
+    r_sq = sh_sq[0];
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y
+                   + gl_GlobalInvocationID.z * 65535u;
+    if (row >= pc.rows) return;
+
+    float s, q;
+    reduce2(s, q);
+    const float mean = s / float(pc.cols);
+    // E[x^2] - E[x]^2 form; alternative (x-mean)^2 pass would be more
+    // accurate for pathological inputs, fine for our tolerance budget.
+    const float var = max(q / float(pc.cols) - mean * mean, 0.0);
+    const float inv = 1.0 / sqrt(var + pc.eps);
+
+    if (lid == 0u) {
+        sh_mean = mean;
+        sh_inv = inv;
+    }
+    barrier();
+
+    const uint base = row * pc.cols;
+    for (uint i = lid; i < pc.cols; i += RVC_NORM_TILE) {
+        out_data[base + i] = (x[base + i] - sh_mean) * sh_inv * gamma[i] + beta[i];
+    }
+}

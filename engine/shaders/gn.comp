@@ -1,0 +1,75 @@
+// GroupNorm (biased variance), general form: x [B, C, S...] flattened as
+// [G, Cpg*S] (G groups, Cpg channels per group, S = prod(spatial dims)).
+// Per group (one row): mean/var over Cpg*S elements; affine with
+// gamma[g*Cpg + channel], beta[g*Cpg + channel] where channel = (i/S)%Cpg.
+//
+// This is the GPU counterpart of nn.group_norm for the hubert conv-stack
+// GroupNorm (512 groups of 1 channel -> row = channel, S = frame length).
+// One workgroup (256 threads) per group, three strided passes with tree
+// reduction through shared memory (same structure as layernorm.comp).
+#version 450
+
+#define RVC_NORM_TILE 256
+
+layout(local_size_x = RVC_NORM_TILE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };      // [G, Cpg*S]
+layout(set = 0, binding = 1) readonly buffer BG { float gamma[]; };  // [C]
+layout(set = 0, binding = 2) readonly buffer BB { float beta[]; };   // [C]
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };        // [G, Cpg*S]
+
+layout(push_constant) uniform PC {
+    uint G;     // groups (rows)
+    uint Cpg;   // channels per group
+    uint S;     // spatial elements per channel
+    float eps;
+} pc;
+
+shared float sh_sum[RVC_NORM_TILE];
+shared float sh_sq[RVC_NORM_TILE];
+shared float sh_mean;
+shared float sh_inv;
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y
+                   + gl_GlobalInvocationID.z * 65535u;
+    if (row >= pc.G) return;
+
+    const uint cols = pc.Cpg * pc.S;
+    const uint base = row * cols;
+    const uint gbase = row * pc.Cpg;
+
+    float s = 0.0;
+    float q = 0.0;
+    for (uint i = lid; i < cols; i += RVC_NORM_TILE) {
+        const float v = x[base + i];
+        s += v;
+        q += v * v;
+    }
+    sh_sum[lid] = s;
+    sh_sq[lid] = q;
+    barrier();
+    for (uint d = RVC_NORM_TILE / 2u; d > 0u; d >>= 1u) {
+        if (lid < d) {
+            sh_sum[lid] += sh_sum[lid + d];
+            sh_sq[lid] += sh_sq[lid + d];
+        }
+        barrier();
+    }
+    const float mean = sh_sum[0] / float(cols);
+    const float var  = max(sh_sq[0] / float(cols) - mean * mean, 0.0);
+    const float inv  = 1.0 / sqrt(var + pc.eps);
+
+    if (lid == 0u) {
+        sh_mean = mean;
+        sh_inv = inv;
+    }
+    barrier();
+
+    for (uint i = lid; i < cols; i += RVC_NORM_TILE) {
+        const uint chan = gbase + (i / pc.S);
+        out_data[base + i] = (x[base + i] - sh_mean) * sh_inv
+                           * gamma[chan] + beta[chan];
+    }
+}

@@ -1,0 +1,53 @@
+// E2/C3 (stage E): in-GPU im2col for conv1d backward gw / forward —
+// replace host assembly (pad + sliding_window_view + transpose + reshape +
+// copy) with a GPU gather.
+//
+// Output row-major xw[B*oL, C*K_dil]:
+//   xw[row = b*oL + t, col = c*K_dil + k] =
+//       x[b, c, t*stride - pad_l + k*dilation]  (0.0 if outside [0, T))
+//
+// Bit-identical to the host recipe (zeros exact +0.0, values copied
+// unchanged, nothing reordered) — feeding into the same matmul yields
+// byte-identical results to the host path. J10: dilation now supported
+// (interval-window gather; previously dilation=1 only, caller fell back
+// to host).
+//
+// One thread per output element, flat 1D indexing (AMD gid.x trick,
+// same as insert_zeros_2x.comp). Grid: gx = ceilDiv(B*oL*C*K_dil, 256).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [B, C, T]
+layout(set = 0, binding = 1) buffer BO { float out_data[]; };     // [B*oL, C*K_dil]
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C;
+    uint T;
+    uint oL;
+    uint K_dil;
+    uint stride;
+    uint pad_l;
+    uint dilation;
+} pc;
+
+void main() {
+    const uint total = pc.B * pc.oL * pc.C * pc.K_dil;
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    const uint col = idx % (pc.C * pc.K_dil);
+    const uint row = idx / (pc.C * pc.K_dil);
+    const uint k = col % pc.K_dil;
+    const uint c = col / pc.K_dil;
+    const uint t = row % pc.oL;
+    const uint b = row / pc.oL;
+
+    const int src = int(t) * int(pc.stride) - int(pc.pad_l) + int(k) * int(pc.dilation);
+    if (src < 0 || src >= int(pc.T)) {
+        out_data[idx] = 0.0;
+    } else {
+        out_data[idx] = x[(b * pc.C + c) * pc.T + uint(src)];
+    }
+}

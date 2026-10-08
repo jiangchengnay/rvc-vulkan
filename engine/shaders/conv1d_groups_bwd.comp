@@ -1,0 +1,151 @@
+// Grouped 1D convolution backward (DiscriminatorS conv1d_groups bp) — one
+// shader, three dispatch modes, one output per dispatch (engine BatchEntry
+// binds ≤4 buffers, so gx/gw/gb are produced by three separate dispatches
+// of the same kernel with different push `mode`):
+//   mode 0: gx[B,C_in,L] = conv_transpose1d_groups(go, w)   (per input elem)
+//   mode 1: gw[C_out,C_in_g,K] = Σ_{b,lo} go[b,o,lo] * x_pad[b,g*C_in_g+ci_g, lo*stride+kk*dil]
+//   mode 2: gb[C_out] = Σ_{b,lo} go[b,o,lo]
+// x=[B,C_in,L], w=[C_out,C_in_g,K] (PyTorch groups layout), go=[B,C_out,L_out].
+// Groups: g = ci_abs / C_in_g (input channel block) == o / O_g (output block);
+// O_g = C_out / gs, gs = C_in / C_in_g. symmetric pad_l. dilation general
+// (J24: dec/enc dilated conv1d bp — tap kk reads x at lo*stride+kk*dil-pad).
+// Accumulation is float32 per-element (engine f32 vs numpy f64 reference
+// differs by ~1e-6 rel — within training tolerance).
+//
+// J12: mode 1 (gw) rewritten as one workgroup per weight element with
+// shared-memory tree reduction (64 lanes split the L_out axis): the old
+// version had ~1 thread per weight element looping L_out (17280) serially
+// (~50ms+ for the gr256 layer); now parallelised 64x over lanes.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };    // [B, C_in, L]
+layout(set = 0, binding = 1) readonly buffer BW { float w[]; };    // [C_out, C_in_g, K]
+layout(set = 0, binding = 2) readonly buffer BGO { float go[]; };  // [B, C_out, L_out]
+layout(set = 0, binding = 3) buffer BOUT { float out_data[]; };    // mode-dependent
+
+shared float sacc[64];
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C_in;
+    uint C_in_g;
+    uint L;
+    uint C_out;
+    uint K;
+    uint stride;
+    uint pad_l;
+    uint pad_r;   // unused (sym padding)
+    uint dilation;
+    uint L_out;
+    uint mode;    // 0=gx 1=gw 2=gb
+} pc;
+
+void main() {
+    const uint gs = pc.C_in / pc.C_in_g;
+    const uint O_g = pc.C_out / gs;
+    const int dil = int(pc.dilation);
+
+    if (pc.mode == 1u) {
+        // gw[C_out, C_in_g, K] — one workgroup per weight element; 64 lanes
+        // split lo axis, tree-reduce in shared memory (grid = gw_total).
+        const uint gw_total = pc.C_out * pc.C_in_g * pc.K;
+        const uint wid = gl_WorkGroupID.x;
+        if (wid >= gw_total) return;
+        const uint lane = gl_LocalInvocationIndex;
+        const uint o = wid / (pc.C_in_g * pc.K);
+        const uint rem = wid % (pc.C_in_g * pc.K);
+        const uint ci_g = rem / pc.K;
+        const uint kk = rem - ci_g * pc.K;
+        const uint g = o / O_g;
+        const uint cs = g * pc.C_in_g;
+        float acc = 0.0;
+        for (uint lo = lane; lo < pc.L_out; lo += 64u) {
+            const int pos = int(lo) * int(pc.stride) + int(kk) * dil - int(pc.pad_l);
+            if (pos >= 0 && pos < int(pc.L)) {
+                for (uint bb = 0u; bb < pc.B; bb++) {
+                    acc += go[(bb * pc.C_out + o) * pc.L_out + lo] *
+                           x[(bb * pc.C_in + cs + ci_g) * pc.L + uint(pos)];
+                }
+            }
+        }
+        sacc[lane] = acc;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (lane < s) sacc[lane] += sacc[lane + s];
+            barrier();
+        }
+        if (lane == 0u) out_data[wid] = sacc[0];
+        return;
+    }
+
+    const uint gid = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 0u) {
+        // gx[B,C_in,L]: each input element (b, ci_abs, t) accumulates over
+        // its group's output channels and taps.
+        const uint total = pc.B * pc.C_in * pc.L;
+        if (gid >= total) return;
+        const uint bb = gid / (pc.C_in * pc.L);
+        const uint rem = gid % (pc.C_in * pc.L);
+        const uint ci_abs = rem / pc.L;
+        const uint t = rem % pc.L;
+        const uint g = ci_abs / pc.C_in_g;
+        const uint ci_g = ci_abs - g * pc.C_in_g;
+        const uint x_off = (bb * pc.C_in + ci_abs) * pc.L;
+        // J26: two accumulator chains (even/odd og) to expose ILP on the
+        // serial og×K MAC dependency chain — AMD FMAC can dual-issue, so a
+        // single 576-long chain wastes half the ALU (each chain is an
+        // independent load→fma stream; K taps inner, compiler unrolls).
+        // ~1.5x expected on dec-size shapes.
+        const int tpad = int(t) + int(pc.pad_l);
+        float acc0 = 0.0;
+        float acc1 = 0.0;
+        uint og = 0u;
+        for (; og + 1u < O_g; og += 2u) {
+            const uint o0 = g * O_g + og;
+            const uint o1 = o0 + 1u;
+            for (uint kk = 0u; kk < pc.K; kk++) {
+                const int diff = tpad - int(kk) * dil;
+                if (diff < 0) continue;
+                if (uint(diff) % pc.stride != 0u) continue;
+                const uint lo = uint(diff / int(pc.stride));
+                if (lo < pc.L_out) {
+                    const uint go0 = (bb * pc.C_out + o0) * pc.L_out + lo;
+                    const uint go1 = (bb * pc.C_out + o1) * pc.L_out + lo;
+                    const uint wb0 = (o0 * pc.C_in_g + ci_g) * pc.K + kk;
+                    const uint wb1 = (o1 * pc.C_in_g + ci_g) * pc.K + kk;
+                    acc0 += go[go0] * w[wb0];
+                    acc1 += go[go1] * w[wb1];
+                }
+            }
+        }
+        for (; og < O_g; og++) {
+            const uint o = g * O_g + og;
+            for (uint kk = 0u; kk < pc.K; kk++) {
+                const int diff = tpad - int(kk) * dil;
+                if (diff < 0) continue;
+                if (uint(diff) % pc.stride != 0u) continue;
+                const uint lo = uint(diff / int(pc.stride));
+                if (lo < pc.L_out) {
+                    acc0 += go[(bb * pc.C_out + o) * pc.L_out + lo] *
+                            w[(o * pc.C_in_g + ci_g) * pc.K + kk];
+                }
+            }
+        }
+        out_data[x_off + t] = acc0 + acc1;
+        return;
+    }
+
+    // mode 2: gb[C_out]
+    if (gid >= pc.C_out) return;
+    const uint o = gid;
+    float acc = 0.0;
+    for (uint bb = 0u; bb < pc.B; bb++) {
+        for (uint lo = 0u; lo < pc.L_out; lo++) {
+            acc += go[(bb * pc.C_out + o) * pc.L_out + lo];
+        }
+    }
+    out_data[o] = acc;
+}

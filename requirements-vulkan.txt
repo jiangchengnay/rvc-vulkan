@@ -1,0 +1,38 @@
+# RVC-Vulkan deps list (de-CUDA). ASCII-only on purpose (Windows pip decodes
+# requirements files with locale encoding GBK; UTF-8 comments break it).
+# Goal: NO torch / transformers / faiss / torchfcpe / torchaudio needed.
+# [core] required | [opt] only for that feature. All pure-CPU (no CUDA).
+
+# ==== core numeric/audio ====
+numpy>=1.26
+scipy>=1.13
+soundfile>=0.13
+packaging>=24.0
+
+# ==== inference / WebUI / HTTP API ====
+gradio>=3.14.0,<3.15
+fastapi>=0.88.0,<0.100
+uvicorn>=0.20.0,<0.23
+pydantic>=1.10.13,<2
+setuptools>=75.0,<81
+wheel>=0.45,<1
+tqdm>=4.67.0,<5
+
+# ==== tools / training ====
+scikit-learn>=1.6.0,<2
+matplotlib>=3.8.2,<4
+tensorboard>=2.19.0
+PyYAML>=6.0
+
+# ==== audio decode (opt) ====
+av>=15.1.0,<16
+
+# ==== realtime ====
+sounddevice>=0.5.0,<1
+FreeSimpleGUI>=5.1.0,<5.2
+numba>=0.60,<1
+threadpoolctl>=3.0,<4
+
+# ==== FORBIDDEN (de-CUDA target) ====
+# torch / torchaudio / torchvision / torch-directml
+# transformers / faiss-cpu / torchfcpe / praat-parselmouth / librosa

@@ -1,0 +1,66 @@
+// Softmax over the last dim, numerically stable: for each row of x[rows, cols]
+//   m = max(x); out = exp(x - m) / sum(exp(x - m))
+//
+// One workgroup (256 threads) per row. Three strided passes: max, sum of
+// exp(x-max), then write. Tree reduce through shared memory; max reduce
+// uses fmax semantics, sum reduce uses addition.
+//
+// Row index = gid.y + gid.z*65535 (z-split for rows > 65535). The single-
+// call path dispatches gz=1, so those results are bit-identical to the
+// pre-split shader.
+#version 450
+
+#define RVC_NORM_TILE 256
+
+layout(local_size_x = RVC_NORM_TILE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };  // [rows, cols]
+layout(set = 0, binding = 1) buffer BO { float out_data[]; };     // [rows, cols]
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+} pc;
+
+shared float sh_max[RVC_NORM_TILE];
+shared float sh_sum[RVC_NORM_TILE];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y
+                   + gl_GlobalInvocationID.z * 65535u;
+    if (row >= pc.rows) return;
+
+    const uint base = row * pc.cols;
+
+    // Pass 1: row max
+    float m = -1e30;
+    for (uint i = lid; i < pc.cols; i += RVC_NORM_TILE) {
+        m = max(m, x[base + i]);
+    }
+    sh_max[lid] = m;
+    barrier();
+    for (uint d = RVC_NORM_TILE / 2u; d > 0u; d >>= 1u) {
+        if (lid < d) sh_max[lid] = max(sh_max[lid], sh_max[lid + d]);
+        barrier();
+    }
+    const float row_max = sh_max[0];
+
+    // Pass 2: sum(exp(x - row_max))
+    float s = 0.0;
+    for (uint i = lid; i < pc.cols; i += RVC_NORM_TILE) {
+        s += exp(x[base + i] - row_max);
+    }
+    sh_sum[lid] = s;
+    barrier();
+    for (uint d = RVC_NORM_TILE / 2u; d > 0u; d >>= 1u) {
+        if (lid < d) sh_sum[lid] += sh_sum[lid + d];
+        barrier();
+    }
+    const float inv = 1.0 / sh_sum[0];
+
+    // Pass 3: write
+    for (uint i = lid; i < pc.cols; i += RVC_NORM_TILE) {
+        out_data[base + i] = exp(x[base + i] - row_max) * inv;
+    }
+}

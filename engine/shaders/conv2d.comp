@@ -1,0 +1,244 @@
+// Tiled 2D convolution template: out[B,C_out,OH,OW] = conv(x[B,C_in,H,W],
+// w[C_out,C_in,KH,KW]) + b[C_out], stamped into three SPIR-V modules by
+// glslc `-D RVC_TILE=<n>` (16|32|64), mirroring conv1d.comp (3b0b532):
+//   RVC_TILE=16: 16x16 output tile, 256 threads, 1 output per thread
+//   RVC_TILE=32: 32x32 output tile, 256 threads, 2x2 per thread
+//   RVC_TILE=64: 64x64 output tile, 256 threads, 4x4 per thread
+// The host picks TILE per shape (engine.zig pickConv2dTile).
+//
+// Conv2d is an implicit GEMM over the (C_in*KH*KW) reduction dimension:
+//   Y[Co, OL] = sum_{gk} W[Co, gk] * X_col[gk, OL]
+// where gk = ci*(KH*KW) + kh*KW + kw (same (ci,kh,kw) nesting as the old
+// pointwise shader -> bit-identical float accumulation order), OL = OH*OW
+// (row-major flattened spatial dim), and
+//   X_col[gk][ol] = x[ci, oh*stride_h - pad_h + kh, ow*stride_w - pad_w + kw]
+// with ol = oh*OW + ow and zeros outside [0,H) x [0,W) -> 0 padding.
+// The pad/stride handling lives in the X-tile loader; W is dense.
+//
+// AMD lane0 quirk: never feed a local id through a multiply with a global
+// id term. Tile coords from gl_WorkGroupID.{x,y,z}, per-thread offsets from
+// gl_LocalInvocationID only.
+//
+// vec4 fast path (TILE=64): sW rows dense -> vec4 when C_in*KH*KW % 4 == 0;
+// sX cols: 4 consecutive ol map to 4 consecutive x[] floats when
+// stride_w == 1 AND OW % 4 == 0 (4 consecutive ow stay in the same row).
+// Guarded scalar fallback otherwise; same shared layout + reduction order
+// -> bit-identical results.
+#version 450
+
+#ifndef RVC_TILE
+#error "RVC_TILE must be defined (16|32|64)"
+#endif
+
+#define TILE_16 16
+#define TILE_32 32
+#define TILE_64 64
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [B, C_in, H, W]
+layout(set = 0, binding = 1) readonly buffer BW { float w[]; };   // [C_out, C_in, KH, KW]
+layout(set = 0, binding = 2) readonly buffer BB { float b[]; };   // [C_out] (unused when has_bias==0)
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };     // [B, C_out, OH, OW]
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C_in;
+    uint H;
+    uint W;
+    uint C_out;
+    uint KH;
+    uint KW;
+    uint pad_h;
+    uint pad_w;
+    uint stride_h;
+    uint stride_w;
+    uint OH;
+    uint OW;
+    uint has_bias;
+} pc;
+
+const uint KB = 16u; // reduction block size (units of gk = ci*KH*KW + kh*KW + kw)
+
+#if RVC_TILE == TILE_16
+const uint RPT = 1u;
+shared float sW[16][KB + 1u]; // [16][17] — W tile, padded row stride 17
+shared float sX[KB][16];      // [16][16] — X tile, cols (OL) consecutive
+#elif RVC_TILE == TILE_32
+const uint RPT = 2u;
+shared float sW[32][KB + 1u];
+shared float sX[KB][32];
+#else
+const uint RPT = 4u;
+shared float sW[64][KB + 1u];
+shared float sX[KB][64];
+#endif
+
+// Load one X_col element: gk = ci*(KH*KW) + kh*KW + kw, ol = oh*OW + ow.
+float load_x(uint gk, uint ol) {
+    if (gk >= pc.C_in * pc.KH * pc.KW || ol >= pc.OH * pc.OW) return 0.0;
+    const uint kdim2 = pc.KH * pc.KW;
+    const uint ci = gk / kdim2;
+    const uint rem = gk - ci * kdim2;
+    const uint kh = rem / pc.KW;
+    const uint kw = rem - kh * pc.KW;
+    const uint oh = ol / pc.OW;
+    const uint ow = ol - oh * pc.OW;
+    const int ph = int(oh) * int(pc.stride_h) + int(kh) - int(pc.pad_h);
+    const int pw = int(ow) * int(pc.stride_w) + int(kw) - int(pc.pad_w);
+    if (ph < 0 || ph >= int(pc.H) || pw < 0 || pw >= int(pc.W)) return 0.0;
+    return x[((gl_WorkGroupID.z * pc.C_in + ci) * pc.H + uint(ph)) * pc.W + uint(pw)];
+}
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x; // 0..15, col lane (OL)
+    const uint ly = gl_LocalInvocationID.y; // 0..15, row lane (Co)
+    const uint tid = ly * 16u + lx;         // 0..255
+
+    // Workgroup -> TILE x TILE output tile (gl_WorkGroupID — never gid*N+lid).
+    const uint tc = gl_WorkGroupID.x;       // OL tile col
+    const uint tr = gl_WorkGroupID.y;       // Co tile row
+    const uint olBase = tc * uint(RVC_TILE);
+    const uint coBase = tr * uint(RVC_TILE);
+
+    const uint Kdim = pc.C_in * pc.KH * pc.KW;  // total reduction length
+    const uint OLdim = pc.OH * pc.OW;
+
+#if RVC_TILE == TILE_16
+    float acc = 0.0;
+#else
+    float acc[RPT][RPT];
+    for (uint i = 0u; i < RPT; i++)
+        for (uint j = 0u; j < RPT; j++)
+            acc[i][j] = 0.0;
+#endif
+
+    for (uint kt = 0u; kt < Kdim; kt += KB) {
+        // ── Load W tile: sW[TILE][16], TILE*16 elems, RPT per thread ──
+#if RVC_TILE == TILE_64
+        const bool k_aligned = (Kdim & 3u) == 0u;
+        if (k_aligned) {
+            const uint e = tid * 4u;          // 0..1020 step 4
+            const uint r = e >> 4u;           // co row in tile (0..63)
+            const uint cc = (e & 15u) & ~3u;  // 4-aligned gk col in block
+            const uint co = coBase + r;
+            const uint gk = kt + cc;
+            if (co < pc.C_out && gk + 3u < Kdim) {
+                const uint off = co * Kdim + gk;
+                vec4 v = vec4(w[off], w[off + 1u], w[off + 2u], w[off + 3u]);
+                sW[r][cc] = v.x;       sW[r][cc + 1u] = v.y;
+                sW[r][cc + 2u] = v.z;  sW[r][cc + 3u] = v.w;
+            } else if (co < pc.C_out && gk < Kdim) {
+                for (uint q = 0u; q < 4u; q++) {
+                    sW[r][cc + q] = (gk + q < Kdim) ? w[co * Kdim + gk + q] : 0.0;
+                }
+            } else {
+                sW[r][cc] = 0.0;       sW[r][cc + 1u] = 0.0;
+                sW[r][cc + 2u] = 0.0;  sW[r][cc + 3u] = 0.0;
+            }
+        } else
+#endif
+        {
+            for (uint t = 0u; t < RPT; t++) {
+                const uint e = tid + t * 256u;  // 0..TILE*16-1
+                const uint r = e >> 4u;         // co row in tile
+                const uint cc = e & 15u;        // gk col in block
+                const uint co = coBase + r;
+                const uint gk = kt + cc;
+                sW[r][cc] = (co < pc.C_out && gk < Kdim) ? w[co * Kdim + gk] : 0.0;
+            }
+        }
+        // ── Load X tile: sX[16][TILE], 16*TILE elems, RPT per thread ──
+#if RVC_TILE == TILE_64
+        const bool s1 = (pc.stride_w == 1u) && ((pc.OW & 3u) == 0u);
+        if (s1) {
+            const uint e = tid * 4u;          // 0..1020 step 4
+            const uint k = e >> 6u;           // gk row in block (0..15)
+            const uint cc = (e & 63u) & ~3u;  // 4-aligned OL col in tile
+            const uint gk = kt + k;
+            const uint ol = olBase + cc;
+            if (gk < Kdim && ol + 3u < OLdim) {
+                const uint kdim2 = pc.KH * pc.KW;
+                const uint ci = gk / kdim2;
+                const uint rem = gk - ci * kdim2;
+                const uint kh = rem / pc.KW;
+                const uint kw = rem - kh * pc.KW;
+                const uint oh = ol / pc.OW;
+                const uint ow = ol - oh * pc.OW;  // ow % 4 == 0 (cc 4-aligned)
+                const int ph = int(oh) * int(pc.stride_h) + int(kh) - int(pc.pad_h);
+                const int pw = int(ow) + int(kw) - int(pc.pad_w); // stride_w==1
+                if (ph >= 0 && ph < int(pc.H) && pw >= 0 && pw + 3 < int(pc.W)) {
+                    const uint off = ((gl_WorkGroupID.z * pc.C_in + ci) * pc.H + uint(ph)) * pc.W + uint(pw);
+                    vec4 v = vec4(x[off], x[off + 1u], x[off + 2u], x[off + 3u]);
+                    sX[k][cc] = v.x;       sX[k][cc + 1u] = v.y;
+                    sX[k][cc + 2u] = v.z;  sX[k][cc + 3u] = v.w;
+                } else {
+                    for (uint q = 0u; q < 4u; q++) {
+                        const int pw2 = pw + int(q);
+                        sX[k][cc + q] = (ph >= 0 && ph < int(pc.H) &&
+                                         pw2 >= 0 && pw2 < int(pc.W))
+                            ? x[((gl_WorkGroupID.z * pc.C_in + ci) * pc.H + uint(ph)) * pc.W + uint(pw2)]
+                            : 0.0;
+                    }
+                }
+            } else if (gk < Kdim && ol < OLdim) {
+                for (uint q = 0u; q < 4u; q++) {
+                    sX[k][cc + q] = (ol + q < OLdim) ? load_x(gk, ol + q) : 0.0;
+                }
+            } else {
+                sX[k][cc] = 0.0;       sX[k][cc + 1u] = 0.0;
+                sX[k][cc + 2u] = 0.0;  sX[k][cc + 3u] = 0.0;
+            }
+        } else
+#endif
+        {
+            for (uint t = 0u; t < RPT; t++) {
+                const uint e = tid + t * 256u;  // 0..16*TILE-1
+                const uint k = e / uint(RVC_TILE);   // gk row in block (0..15)
+                const uint cc = e - k * uint(RVC_TILE); // OL col in tile
+                sX[k][cc] = load_x(kt + k, olBase + cc);
+            }
+        }
+        barrier();
+
+        // ── Accumulate: thread's RPT x RPT output block ──
+        // gk order within the block is cc=0..15, kt steps by 16 — gk
+        // increases monotonically, identical to the old shader's
+        // (ci,kh,kw) nesting -> bit-identical float accumulation.
+        for (uint kk = 0u; kk < KB; kk++) {
+            for (uint i = 0u; i < RPT; i++) {
+                const float av = sW[ly * RPT + i][kk];
+                for (uint j = 0u; j < RPT; j++) {
+#if RVC_TILE == TILE_16
+                    acc += av * sX[kk][lx];
+#else
+                    acc[i][j] += av * sX[kk][lx * RPT + j];
+#endif
+                }
+            }
+        }
+        barrier(); // protect sW/sX until every lane is done reading
+    }
+
+    // ── Write output (WorkGroupID-derived indices — safe index form) ──
+#if RVC_TILE == TILE_16
+    const uint co = coBase + ly;
+    const uint ol = olBase + lx;
+    if (co < pc.C_out && ol < OLdim) {
+        float v = acc;
+        if (pc.has_bias == 1u) v += b[co];
+        out_data[(gl_WorkGroupID.z * pc.C_out + co) * OLdim + ol] = v;
+    }
+#else
+    for (uint i = 0u; i < RPT; i++) {
+        const uint co = coBase + ly * RPT + i;
+        if (co >= pc.C_out) break;
+        const float bv = (pc.has_bias == 1u) ? b[co] : 0.0;
+        for (uint j = 0u; j < RPT; j++) {
+            const uint ol = olBase + lx * RPT + j;
+            if (ol >= OLdim) break;
+            out_data[(gl_WorkGroupID.z * pc.C_out + co) * OLdim + ol] = acc[i][j] + bv;
+        }
+    }
+#endif
+}

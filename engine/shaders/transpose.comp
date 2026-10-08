@@ -1,0 +1,51 @@
+// Tiled GPU transpose (T16): out[P, C] = src[C, P] * scale, both row-major.
+//
+// Classic shared-memory tiled transpose: each 16x16 workgroup (256 threads)
+// loads one tile of the source [C,P] matrix into shared memory (padded +1 to
+// avoid bank conflicts), syncs, then writes the tile back transposed into the
+// [P,C] output. Bounds checked on both phases, so C/P need not be multiples
+// of 16. `scale` is folded into the write-back so the enc q path can apply
+// the 1/sqrt(kc) attention scaling in the same kernel (scale=1.0 = pure
+// transpose). The kernel is its own inverse: transpose([C,P]) with args
+// swapped (C<->P) yields the reverse direction, so one shader covers both
+// [1,C,P]->[P,C] and [P,C]->[1,C,P].
+//
+// Grid: gx = ceil(P/16) (source column tiles), gy = ceil(C/16) (source row
+// tiles), gz = 1.
+#version 450
+
+#define RVC_TS_TILE 16
+
+layout(local_size_x = RVC_TS_TILE, local_size_y = RVC_TS_TILE, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BS { float src[]; };  // [C, P] row-major
+layout(set = 0, binding = 1) buffer BD { float dst[]; };           // [P, C] row-major
+
+layout(push_constant) uniform PC {
+    uint C;
+    uint P;
+    float scale;
+} pc;
+
+// +1 padding on the row stride keeps the 16 consecutive column accesses of a
+// half-warp on distinct banks (classic shared-memory transpose trick).
+shared float sh[RVC_TS_TILE][RVC_TS_TILE + 1];
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x;
+    const uint ly = gl_LocalInvocationID.y;
+    const uint tx = gl_WorkGroupID.x;
+    const uint ty = gl_WorkGroupID.y;
+    const uint c0 = ty * RVC_TS_TILE + ly;  // source row (C dim)
+    const uint p0 = tx * RVC_TS_TILE + lx;  // source col (P dim)
+    const bool in_bounds = (c0 < pc.C) && (p0 < pc.P);
+
+    // Load phase: coalesced along lx (consecutive p0 -> consecutive src addr).
+    sh[ly][lx] = in_bounds ? src[c0 * pc.P + p0] : 0.0;
+    barrier();
+
+    // Write phase: out[p0, c0] = src[c0, p0] * scale.
+    if (in_bounds) {
+        dst[p0 * pc.C + c0] = sh[ly][lx] * pc.scale;
+    }
+}

@@ -1,0 +1,78 @@
+// Elementwise kernel template, stamped into three SPIR-V modules by
+// glslc -D RVC_OP=<n>:
+//   RVC_OP=1 add  : c[i] = a[i] + b[i]
+//   RVC_OP=2 mul  : c[i] = a[i] * b[i]
+//   RVC_OP=3 relu : a[i] = max(a[i], 0)  (in-place, single binding)
+// 256 threads per workgroup; push constant N = element count.
+//
+// P1 throughput: float4-vectorised. Each thread handles a 4-float group
+// via vec4 loads/stores (one 128-bit transaction per group instead of 4
+// scalar ones — the shader's arithmetic is elementwise so grouping does
+// not change results at all). The tail (N % 4) is handled scalar.
+#version 450
+
+#define RVC_OP_ADD 1
+#define RVC_OP_MUL 2
+#define RVC_OP_RELU 3
+
+#ifndef RVC_OP
+#error "RVC_OP must be defined (1=add, 2=mul, 3=relu)"
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if RVC_OP == RVC_OP_ADD || RVC_OP == RVC_OP_MUL
+layout(set = 0, binding = 0) readonly buffer BA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BB { float b[]; };
+layout(set = 0, binding = 2) buffer BC { float c[]; };
+#else
+layout(set = 0, binding = 0) buffer BA { float a[]; };
+#endif
+
+layout(push_constant) uniform PC {
+    uint N;
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint i4 = gid * 4u;
+
+#if RVC_OP == RVC_OP_ADD || RVC_OP == RVC_OP_MUL
+    // Vec4 main path: group of 4 floats, tail handled scalar.
+    if (i4 + 3u < pc.N) {
+        vec4 va = vec4(a[i4], a[i4 + 1u], a[i4 + 2u], a[i4 + 3u]);
+        vec4 vb = vec4(b[i4], b[i4 + 1u], b[i4 + 2u], b[i4 + 3u]);
+        vec4 vc;
+#if RVC_OP == RVC_OP_ADD
+        vc = va + vb;
+#else
+        vc = va * vb;
+#endif
+        c[i4] = vc.x;
+        c[i4 + 1u] = vc.y;
+        c[i4 + 2u] = vc.z;
+        c[i4 + 3u] = vc.w;
+        return;
+    }
+    for (uint i = i4; i < pc.N && i < i4 + 4u; i++) {
+#if RVC_OP == RVC_OP_ADD
+        c[i] = a[i] + b[i];
+#else
+        c[i] = a[i] * b[i];
+#endif
+    }
+#else
+    if (i4 + 3u < pc.N) {
+        vec4 va = vec4(a[i4], a[i4 + 1u], a[i4 + 2u], a[i4 + 3u]);
+        va = max(va, vec4(0.0));
+        a[i4] = va.x;
+        a[i4 + 1u] = va.y;
+        a[i4 + 2u] = va.z;
+        a[i4 + 3u] = va.w;
+        return;
+    }
+    for (uint i = i4; i < pc.N && i < i4 + 4u; i++) {
+        a[i] = max(a[i], 0.0);
+    }
+#endif
+}

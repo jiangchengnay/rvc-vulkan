@@ -1,0 +1,30 @@
+// Copy: dst[i] = src[i] (flat over N floats). Used to preserve an input
+// before it is overwritten in-place (e.g. ResBlock residual: keep the
+// original x, then add_inplace the conv-chain output onto the copy).
+// P1 throughput: float4-vectorised main path.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BD { float dst[]; };
+layout(set = 0, binding = 1) readonly buffer BS { float src[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint i4 = gid * 4u;
+    if (i4 + 3u < pc.N) {
+        vec4 v = vec4(src[i4], src[i4 + 1u], src[i4 + 2u], src[i4 + 3u]);
+        dst[i4] = v.x;
+        dst[i4 + 1u] = v.y;
+        dst[i4 + 2u] = v.z;
+        dst[i4 + 3u] = v.w;
+        return;
+    }
+    for (uint i = i4; i < pc.N && i < i4 + 4u; i++) {
+        dst[i] = src[i];
+    }
+}

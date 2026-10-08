@@ -1,0 +1,36 @@
+// T18 最小实验：单 kernel 内步间同步成本（纯 barrier 循环，无 matvec）。
+//
+// 任务要求：循环 15001 次、每次一次 barrier，测纯同步开销，判断
+// 单 kernel 串行推进的步间同步是否可能是瓶颈（若每步 barrier
+// ~10-50us ×15001 = 0.15-0.75s 则否决；若远小于此则同步不是问题）。
+//
+// 本 kernel 不做任何权重读取/乘加：每帧每线程仅读自身 h_shared[i]
+// 并写回（最低限度的状态更新语义），随后 workgroup barrier。
+// grid=(1,1,1)，workgroup=256 线程，与 GRU 单方向同构。
+// 输出：h_shared[0] 的最终值写入 binding0（防编译器删除循环）。
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer BOut { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint T;
+    uint H;
+} pc;
+
+shared float h_shared[256];
+
+void main() {
+    const uint i = gl_LocalInvocationID.x;
+    h_shared[i] = 0.0;
+    barrier();
+    for (uint s = 0u; s < pc.T; s++) {
+        h_shared[i] = h_shared[i] + 1.0;
+        barrier();  // 每帧 1 次 workgroup barrier（与 gru.comp 同构）
+    }
+    if (i == 0u) {
+        o[0] = h_shared[0];  // 防止死循环被删除
+    }
+}

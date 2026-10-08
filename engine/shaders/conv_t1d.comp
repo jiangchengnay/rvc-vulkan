@@ -1,0 +1,206 @@
+// Tiled 1D transposed convolution template: out[B,C_out,L_out] = convT(
+// x[B,C_in,L], w[C_in,C_out,K]) + b[C_out], stamped into three SPIR-V
+// modules by glslc `-D RVC_TILE=<n>` (16|32|64), mirroring the proven
+// matmul.comp / conv1d.comp pattern:
+//   RVC_TILE=16: 16x16 output tile, 256 threads, 1 output per thread
+//   RVC_TILE=32: 32x32 output tile, 256 threads, 2x2 per thread
+//   RVC_TILE=64: 64x64 output tile, 256 threads, 4x4 per thread
+// The host picks TILE per shape (engine.zig pickConvT1dTile); small shapes
+// need many small workgroups, big shapes need deep register blocking.
+//
+// ── Reduction mapping (the conv1d difference that matters) ──────────────
+// Conv1d is an implicit GEMM over gk = ci*K + k (C_in-major): the old
+// pointwise conv1d shader nested (ci outer, k inner), so the monotone
+// gk loop is bit-identical. conv_t1d's old pointwise shader (now
+// conv_t1d_naive.comp) nests the OTHER way — (k outer, ci inner):
+//     for kk in 0..K { for c in 0..C_in { acc += x[c,i(kk)] * w[c,o,kk] } }
+// so its reduction index is gk' = k*C_in + ci (k-major). To stay
+// bit-identical (maxdiff=0) the tile must accumulate gk' monotonically,
+// NOT gk = ci*K + k — a naively copied conv1d tile would reorder the
+// float adds and drift by ulps. Hence:
+//     gk' = k*C_in + ci,   ci = gk' % C_in,   k = gk' / C_in
+// and the X-tile loader maps (gk', lo) -> x[ci, (lo+pad-k*dil)/stride].
+//
+// ── Trade-off vs conv1d ─────────────────────────────────────────────────
+// sW rows: W_t[co][gk'] = w[ci,co,k] — consecutive gk' (fixed k, varying
+// ci) are C_out*K floats apart, so NO vec4 W load (conv1d's vec4 needed
+// C_in*K%4==0 dense gk rows; here it is not memory-dense).
+// sX cols: 4 consecutive lo map to input cols ~lo/stride apart (stride
+// 10/2 in dec ups) and need per-lo divisibility checks — NO vec4 X load.
+// Both stay on the guarded scalar path (the same path conv1d falls back
+// to); the win comes from shared-memory tiling + register blocking RPT,
+// same as conv1d. Dec ups K=16/K=4, C_in up to 512 -> Kdim=C_in*K big.
+//
+// ── AMD Radeon Pro VII lane0 quirk (see matmul.comp) ────────────────────
+// Never feed a local id through a multiply with a global id term. Tile
+// coords come from gl_WorkGroupID.{x,y,z} (Lo tile, Co tile, batch) and
+// per-thread offsets from gl_LocalInvocationID only; gl_GlobalInvocationID
+// is never used.
+//
+// ── T1.1 分段 ───────────────────────────────────────────────────────────
+// in_off/l_seg（输入窗口）、lo_off（输出段起始绝对列）、L_out_full（输出
+// 行全长步长）与 naive kernel 逐字段一致：整段时 in_off=0/l_seg=L/
+// lo_off=0/L_out_full=L_out → 索引与 naive 完全相同（零回归）。
+#version 450
+
+#ifndef RVC_TILE
+#error "RVC_TILE must be defined (16|32|64)"
+#endif
+
+#define TILE_16 16
+#define TILE_32 32
+#define TILE_64 64
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [B, C_in, L]
+layout(set = 0, binding = 1) readonly buffer BW { float w[]; };   // [C_in, C_out, K]
+layout(set = 0, binding = 2) readonly buffer BB { float b[]; };   // [C_out] (unused when has_bias==0)
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };     // [B, C_out, L_out]
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C_in;
+    uint L;
+    uint C_out;
+    uint K;
+    uint stride;
+    uint padding;
+    uint output_padding;
+    uint dil;
+    uint L_out;
+    uint has_bias;
+    uint in_off;    // T1.1 分段：输入窗口起始列（绝对）；整段=0
+    uint l_seg;     // T1.1 分段：输入窗口长度（仅边界检查，整段=L）
+    uint lo_off;    // T1.1 分段：输出段起始列（绝对）；整段=0
+    uint L_out_full; // T1.1 分段：输出全长行步长（段内寻址用）；整段=L_out
+} pc;
+
+const uint KB = 16u; // reduction block size (in units of gk' = k*C_in + ci)
+
+#if RVC_TILE == TILE_16
+const uint RPT = 1u;
+shared float sW[16][KB + 1u]; // [16][17] — W tile, padded row stride 17
+shared float sX[KB][16];      // [16][16] — X tile, cols (Lo) consecutive
+#elif RVC_TILE == TILE_32
+const uint RPT = 2u;
+shared float sW[32][KB + 1u]; // [32][17]
+shared float sX[KB][32];      // [16][32]
+#else
+const uint RPT = 4u;
+shared float sW[64][KB + 1u]; // [64][17]
+shared float sX[KB][64];      // [16][64]
+#endif
+
+// Load one X_col element for conv_t1d: gk' = k*C_in + ci (reduction index,
+// k-major — bit-identical order to conv_t1d_naive.comp), ol = output col.
+// Returns 0 when gk' is past C_in*K, ol past L_out, or the tap maps outside
+// the (segmented) input window (zero padding), or num%stride != 0 (the
+// output_padding/border cols that match no (i,k) pair).
+// T1.1 分段：ol 为段内列，绝对列 = ol + lo_off（num 用绝对列映射输入）。
+float load_x(uint gk, uint ol) {
+    if (gk >= pc.C_in * pc.K || ol >= pc.L_out) return 0.0;
+    const uint ci = gk % pc.C_in;
+    const uint tap = gk / pc.C_in;
+    const int num = int(ol + pc.lo_off) + int(pc.padding) - int(tap) * int(pc.dil);
+    if (num < 0) return 0.0;
+    if (num % int(pc.stride) != 0) return 0.0;
+    const int i = num / int(pc.stride);
+    // 输入窗口内相对列（仅边界检查；行步长仍用 pc.L 整 buffer）
+    const int is = i - int(pc.in_off);
+    if (is < 0 || is >= int(pc.l_seg)) return 0.0;
+    return x[(gl_WorkGroupID.z * pc.C_in + ci) * pc.L + uint(i)];
+}
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x; // 0..15, col lane (Lo)
+    const uint ly = gl_LocalInvocationID.y; // 0..15, row lane (Co)
+    const uint tid = ly * 16u + lx;         // 0..255
+
+    // Workgroup -> TILE x TILE output tile (gl_WorkGroupID — never gid*N+lid).
+    const uint tc = gl_WorkGroupID.x;       // Lo tile col
+    const uint tr = gl_WorkGroupID.y;       // Co tile row
+    const uint loBase = tc * uint(RVC_TILE);
+    const uint coBase = tr * uint(RVC_TILE);
+
+    const uint Kdim = pc.C_in * pc.K;       // total reduction length
+
+#if RVC_TILE == TILE_16
+    float acc = 0.0;
+#else
+    float acc[RPT][RPT];
+    for (uint i = 0u; i < RPT; i++)
+        for (uint j = 0u; j < RPT; j++)
+            acc[i][j] = 0.0;
+#endif
+
+    for (uint kt = 0u; kt < Kdim; kt += KB) {
+        // ── Load W tile: sW[TILE][16], TILE*16 elems, RPT per thread ──
+        // sW[r][cc] = w[ci, co, k] with (ci,k) = decode(gk' = kt + cc).
+        // (No vec4: consecutive gk' are C_out*K floats apart in memory.)
+        for (uint t = 0u; t < RPT; t++) {
+            const uint e = tid + t * 256u;  // 0..TILE*16-1
+            const uint r = e >> 4u;         // co row in tile
+            const uint cc = e & 15u;        // gk' col in block
+            const uint co = coBase + r;
+            const uint gk = kt + cc;
+            if (co < pc.C_out && gk < Kdim) {
+                const uint ci = gk % pc.C_in;
+                const uint kk = gk / pc.C_in;
+                sW[r][cc] = w[(ci * pc.C_out + co) * pc.K + kk];
+            } else {
+                sW[r][cc] = 0.0;
+            }
+        }
+        // ── Load X tile: sX[16][TILE], 16*TILE elems, RPT per thread ──
+        // (No vec4: stride>1 maps consecutive Lo to non-consecutive input
+        // cols with per-col divisibility checks.)
+        for (uint t = 0u; t < RPT; t++) {
+            const uint e = tid + t * 256u;  // 0..16*TILE-1
+            const uint k = e / uint(RVC_TILE);   // gk' row in block (0..15)
+            const uint cc = e - k * uint(RVC_TILE); // Lo col in tile
+            sX[k][cc] = load_x(kt + k, loBase + cc);
+        }
+        barrier();
+
+        // ── Accumulate: thread's RPT x RPT output block ──
+        // gk' order within the block is cc=0..15, and kt steps by 16 —
+        // monotonically increasing gk' = (k, ci) k-major, identical to the
+        // old shader's (kk, c) nesting -> bit-identical float accumulation.
+        for (uint kk = 0u; kk < KB; kk++) {
+            for (uint i = 0u; i < RPT; i++) {
+                const float av = sW[ly * RPT + i][kk];
+                for (uint j = 0u; j < RPT; j++) {
+#if RVC_TILE == TILE_16
+                    acc += av * sX[kk][lx];
+#else
+                    acc[i][j] += av * sX[kk][lx * RPT + j];
+#endif
+                }
+            }
+        }
+        barrier(); // protect sW/sX until every lane is done reading
+    }
+
+    // ── Write output (WorkGroupID-derived indices — safe index form) ──
+#if RVC_TILE == TILE_16
+    const uint co = coBase + ly;
+    const uint lo = loBase + lx;
+    if (co < pc.C_out && lo < pc.L_out) {
+        float v = acc;
+        if (pc.has_bias == 1u) v += b[co];
+        out_data[(gl_WorkGroupID.z * pc.C_out + co) * pc.L_out_full + (lo + pc.lo_off)] = v;
+    }
+#else
+    for (uint i = 0u; i < RPT; i++) {
+        const uint co = coBase + ly * RPT + i;
+        if (co >= pc.C_out) break;
+        const float bv = (pc.has_bias == 1u) ? b[co] : 0.0;
+        for (uint j = 0u; j < RPT; j++) {
+            const uint lo = loBase + lx * RPT + j;
+            if (lo >= pc.L_out) break;
+            out_data[(gl_WorkGroupID.z * pc.C_out + co) * pc.L_out_full + (lo + pc.lo_off)] = acc[i][j] + bv;
+        }
+    }
+#endif
+}

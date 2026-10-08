@@ -1,0 +1,66 @@
+// Grouped 1D convolution (fwd): out[B,C_out,L_out] = conv_groups(x[B,C_in,L],
+// w[C_out,C_in_g,K], groups) + b[C_out] where C_in_g = C_in/groups and each
+// output channel co belongs to group g = co / (C_out/groups); its receptive
+// field is x[b, g*C_in_g .. g*C_in_g+C_in_g, :] and w row co (C_in_g*K taps).
+//
+// Naive per-thread kernel (one output element per invocation): the grouped
+// convs used in DiscriminatorS have tiny per-group reductions (C_in_g=4,
+// K<=41 -> <=164 MAC), so a shared-memory tiled kernel would over-engineer
+// it. dilation is fixed at 1 (DiscriminatorS never uses dilation); padding
+// is symmetric (pad_l), stride/pad handled in the tap->pos mapping.
+//
+// Buffer layout (matches conv1d.comp): x=[B,C_in,L], w=[C_out,C_in_g,K],
+// b=[C_out], out=[B,C_out,L_out].
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [B, C_in, L]
+layout(set = 0, binding = 1) readonly buffer BW { float w[]; };   // [C_out, C_in_g, K]
+layout(set = 0, binding = 2) readonly buffer BB { float bb_buf[]; }; // [C_out]
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };     // [B, C_out, L_out]
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C_in;
+    uint C_in_g;
+    uint L;
+    uint C_out;
+    uint K;
+    uint stride;
+    uint pad_l;
+    uint pad_r;   // unused (sym padding assumed by host)
+    uint L_out;
+    uint has_bias;
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint total = pc.B * pc.C_out * pc.L_out;
+    if (gid >= total) return;
+
+    const uint lo = gid % pc.L_out;
+    const uint co = (gid / pc.L_out) % pc.C_out;
+    const uint b = gid / (pc.L_out * pc.C_out);
+
+    const uint gs = pc.C_in / pc.C_in_g;      // number of groups
+    const uint O_g = pc.C_out / gs;           // output channels per group
+    const uint g = co / O_g;                  // group of this output channel
+
+    const uint Kdim = pc.C_in_g * pc.K;
+    const uint x_base = (b * pc.C_in + g * pc.C_in_g) * pc.L;
+    const uint w_base = co * Kdim;
+
+    float acc = 0.0;
+    for (uint gk = 0u; gk < Kdim; gk++) {
+        const uint ci_g = gk / pc.K;
+        const uint tap = gk - ci_g * pc.K;
+        const int pos = int(lo) * int(pc.stride) + int(tap) - int(pc.pad_l);
+        if (pos >= 0 && pos < int(pc.L)) {
+            acc += x[x_base + ci_g * pc.L + uint(pos)] * w[w_base + gk];
+        }
+    }
+
+    out_data[(b * pc.C_out + co) * pc.L_out + lo] =
+        acc + (pc.has_bias == 1u ? bb_buf[co] : 0.0);
+}

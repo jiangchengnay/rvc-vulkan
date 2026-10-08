@@ -1,0 +1,50 @@
+// Gating backward — fused inverse of gating.comp (op18).
+//
+// Forward (op18): c[i] = tanh(a[i] + g1) * sigmoid(a[i+n] + g2)
+//   a[i]   = tanh-branch input, a[i+n] = sigmoid-branch input (n = H*L)
+//   g1 = b[b_idx], g2 = b[b_idx + H*Lg]  (same indexing as op18)
+//
+// Backward: given go (grad wrt c), recompute t/s and write g_acts_in:
+//   g_acts_in[i]   = go[i] * s * (1 - t*t)      (grad wrt a[i],  tanh branch)
+//   g_acts_in[i+n] = go[i] * t * s * (1 - s)    (grad wrt a[i+n], sigmoid branch)
+// grad wrt cond b is the caller's responsibility (slice/reduce of g_acts_in).
+// sigmoid matches gating.comp branch-for-branch (D5 precedent, ~1e-7).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BGO { float go[]; };
+layout(set = 0, binding = 1) readonly buffer BA { float a[]; };
+layout(set = 0, binding = 2) readonly buffer BB { float b[]; };
+layout(set = 0, binding = 3) buffer BG { float g[]; };
+
+layout(push_constant) uniform PC {
+    uint n;   // H*L
+    uint lg;  // g time dim (1 or L)
+    uint h;   // hidden half (flow: 192)
+    uint off; // g segment start offset (elements)
+} pc;
+
+float sigmoidf(float x) {
+    return x >= 0.0 ? 1.0 / (1.0 + exp(-x)) : exp(x) / (1.0 + exp(x));
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    const uint L = pc.n / pc.h;
+    const uint hlg = pc.h * pc.lg;
+    uint b_idx;
+    if (pc.lg == 1u) {
+        b_idx = pc.off + i / L;
+    } else {
+        b_idx = pc.off + (i / L) * pc.lg + (i % L);
+    }
+    const float g1 = b[b_idx];
+    const float g2 = b[b_idx + hlg];
+    const float t = tanh(a[i] + g1);
+    const float s = sigmoidf(a[i + pc.n] + g2);
+    const float gg = go[i];
+    g[i] = gg * s * (1.0 - t * t);
+    g[i + pc.n] = gg * t * s * (1.0 - s);
+}

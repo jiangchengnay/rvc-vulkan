@@ -1,0 +1,96 @@
+// T18：rmvpe BiGRU 单 kernel GPU 化评估（实验 kernel）。
+//
+// 核心问题：单 kernel 内循环（非逐帧 dispatch）的步间同步成本是否
+// 低于 host numpy 逐帧循环（60s 档 1.21s / 178s ~3s）。
+//
+// 设计（单 dispatch 双向并行，grid z=2）：
+//   - 一个 workgroup = 256 线程，串行推进 T 帧；h 状态驻留共享内存
+//     h_shared[256]，帧间仅需 1 次 workgroup barrier（h 更新后）。
+//   - 每帧每线程算 r/z/n 三行 matvec（gh = h @ w_hh.T + b_hh，每行
+//     H=256 点积），随后门控（sigmoid/tanh）更新 h —— 所有 gh 值由
+//     本线程独立算出，无跨线程广播，故除 h 更新 barrier 外零同步。
+//   - 双向：fwd 权重在前半区、rev 权重在后半区（调用侧拼接），
+//     缓冲区布局见注释；kernel 内完成反向索引翻转（fwd/rev 并行）。
+//
+// 数学对齐 rmvpe._bgru（PyTorch GRU，门序 r,z,n）：
+//   r = sigmoid(gx_r + gh_r)；z = sigmoid(gx_z + gh_z)
+//   n = tanh(gx_n + r * gh_n)；h = (1-z)*n + z*h_prev
+//   gx_all = x @ w_ih.T + b_ih（host 一次 matmul），w_hh 为 [3H,H]
+//   行主序（gh = h @ w_hh.T，gh[i] = dot(h, w_hh[i,:])）。
+//
+// Grid: (1, 1, 2)。wg(z=0)=fwd，wg(z=1)=rev（各自独立权重半区）。
+// 精度：float32 全链路，sigmoid/tanh 用 GLSL exp/tanh（非 fast math）。
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BIn { float gx_all[]; };  // [2][T, 3H] 行主序（fwd/rev 各 T 帧，门序 r,z,n）
+layout(set = 0, binding = 1) readonly buffer BW { float w_hh[]; };    // [2][3H, H] 行主序（fwd/rev 各 3H x H）
+layout(set = 0, binding = 2) readonly buffer BB { float b_hh[]; };    // [2][3H]（fwd/rev 各 3H）
+layout(set = 0, binding = 3) buffer BOut { float o[]; };             // [T, 2H]（前 H=fwd、后 H=rev）
+
+layout(push_constant) uniform PC {
+    uint T;
+    uint H;
+} pc;
+
+// H<=256（rmvpe H=256；共享内存 h 驻留，编译期尺寸上限）
+shared float h_shared[256];
+
+float rvc_sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    const uint H = pc.H;
+    const uint T = pc.T;
+    const uint i = gl_LocalInvocationID.x;
+    const uint rev = gl_WorkGroupID.z;  // 0=fwd, 1=rev
+    const uint K = 3u * H;
+    const uint H2 = 2u * H;
+    // 各半区偏移
+    const uint gx_off = rev * (T * K);       // gx 半区起始
+    const uint w_off = rev * (K * H);        // w 半区起始
+    const uint b_off = rev * K;              // b 半区起始
+    const uint out_off = rev * H;            // out 列偏移（fwd=0, rev=H）
+
+    h_shared[i] = 0.0;
+    barrier();
+
+    for (uint s = 0u; s < T; s++) {
+        // 反向：输入帧号与输出帧号都取镜像（kernel 内完成翻转）
+        const uint t = (rev == 0u) ? s : (T - 1u - s);
+        const uint gx_base = gx_off + t * K;
+
+        // 三行 matvec（每线程独立，无共享需求）：
+        //   gh[i]   = dot(h, w[i*H..i*H+H))   + b[i]
+        //   gh[H+i] = dot(h, w[(H+i)*H..))     + b[H+i]
+        //   gh[2H+i]= dot(h, w[(2H+i)*H..))    + b[2H+i]
+        const uint wr0 = b_off + i;
+        const uint wr1 = b_off + H + i;
+        const uint wr2 = b_off + 2u * H + i;
+        float acc_r = b_hh[wr0];
+        float acc_z = b_hh[wr1];
+        float acc_n = b_hh[wr2];
+        const uint row_r = w_off + i * H;
+        const uint row_z = w_off + (H + i) * H;
+        const uint row_n = w_off + (2u * H + i) * H;
+        for (uint k = 0u; k < H; k++) {
+            const float hv = h_shared[k];
+            acc_r += hv * w_hh[row_r + k];
+            acc_z += hv * w_hh[row_z + k];
+            acc_n += hv * w_hh[row_n + k];
+        }
+
+        const float r = rvc_sigmoid(gx_all[gx_base + i] + acc_r);
+        const float z = rvc_sigmoid(gx_all[gx_base + H + i] + acc_z);
+        const float n = tanh(gx_all[gx_base + 2u * H + i] + r * acc_n);
+        const float h_new = (1.0 - z) * n + z * h_shared[i];
+
+        o[t * H2 + out_off + i] = h_new;
+        h_shared[i] = h_new;
+        // 帧间同步点：下一帧所有线程必须读到更新后的 h（每帧 1 barrier）
+        barrier();
+    }
+}

@@ -1,0 +1,215 @@
+// conv_t2d.comp — Transposed-2D convolution engine kernel (Path B, T2).
+//
+// Computes, per output element (block writes a TILE x TILE plane):
+//   out[b, co, h, w] = Σ_{ci,kh,kw} x[b, ci, oh, ow] * w[ci, co, kh, kw]
+// where x = go (the layer output gradient) has shape [B, C_in, OH, OW],
+// w has the PyTorch conv_transpose2d weight layout [C_in, C_out, KH, KW]
+// (i.e. the forward w[O,C,KH,KW] transposed to [C, O, KH, KW] on host),
+// and the transposed-convolution sampling maps the output position back
+// onto the input plane:
+//   oh = (h + ph - kh) / sh   (only when h + ph - kh >= 0, divisible by sh,
+//                              and the resulting index lands inside the
+//                              input's (segmented) H window)
+//   ow = (w + pw - kw) / sw   (same divisibility / bounds rules)
+//   H_out = (OH-1)*sh - 2*ph + KH + opad_h   (W axis analogous; dilation=1)
+// `opad_h/opad_w` only fix the output size (like conv_t1d's output_padding);
+// the shader never reads them — border rows/cols fall out of the sampling
+// rules naturally.
+//
+// This is the 2D generalization of conv_t1d.comp (same 16x16 workgroup,
+// KB=16 reduction block, sW[Co][KB+1] / sX[KB][Lo] shared tiles, RPT
+// unrolling for TILE 16/32/64). Reduction order, gk' = kh*(KW*C_in) +
+// kw*C_in + ci (kh-major, ci innermost), is the exact 2D lift of conv_t1d's
+// k-major gk' = k*C_in + ci, so float accumulation stays monotonic in gk'.
+//
+// gx has no bias term (conv_transpose2d bias is added on the forward side,
+// not in the backward gx path) — has_bias is kept as a 0 field so the push
+// constant layout stays aligned with the conv_t1d family, and binding 2
+// (b[]) is bound to a shared zero buffer that is never read.
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#ifndef RVC_TILE
+#error "RVC_TILE must be defined"
+#endif
+
+#define TILE_16 16
+#define TILE_32 32
+#define TILE_64 64
+
+// ── Bindings ──
+layout(set = 0, binding = 0) readonly  buffer BX { float x[]; };      // [B, C_in, OH, OW]
+layout(set = 0, binding = 1) readonly  buffer BW { float w[]; };      // [C_in, C_out, KH, KW]
+layout(set = 0, binding = 2) readonly  buffer BB { float b[]; };      // unused (has_bias = 0)
+layout(set = 0, binding = 3) writeonly buffer BO { float out_data[]; }; // [B, C_out, H_out, W_out]
+
+// ── Push constants (20 u32) ──
+layout(push_constant) uniform PC {
+    uint B;         // batch
+    uint C_in;      // input channels (= forward output channels, go)
+    uint OH;        // input plane height (go rows)
+    uint OW;        // input plane width  (go cols)
+    uint C_out;     // output channels (= forward input channels, gx)
+    uint KH;        // kernel height
+    uint KW;        // kernel width
+    uint sh;        // stride h
+    uint sw;        // stride w
+    uint ph;        // padding h
+    uint pw;        // padding w
+    uint opad_h;    // output padding h (size only; never read in shader)
+    uint opad_w;    // output padding w (size only; never read in shader)
+    uint H_out;     // output plane height (gx rows)
+    uint W_out;     // output plane width  (gx cols)
+    uint has_bias;  // always 0 for gx (field kept for layout alignment)
+    // H-axis segmentation (T2 T1.1-style, all-zero for the one-shot path):
+    uint in_off;    // input window start row (absolute); whole plane: 0
+    uint h_seg;     // input window height (bounds-check only); whole: OH
+    uint ho_off;    // output segment start row (absolute); whole: 0
+    uint H_out_full;// output buffer row stride (full buffer rows); whole: H_out
+} pc;
+
+const uint KB = 16u; // reduction block size (in units of gk' = kh*(KW*C_in)+kw*C_in+ci)
+
+#if RVC_TILE == TILE_16
+const uint RPT = 1u;
+shared float sW[16][KB + 1u]; // [16][17] — W tile, padded row stride 17
+shared float sX[KB][16];      // [16][16] — X tile, cols (Lo) consecutive
+#elif RVC_TILE == TILE_32
+const uint RPT = 2u;
+shared float sW[32][KB + 1u]; // [32][17]
+shared float sX[KB][32];      // [16][32]
+#else
+const uint RPT = 4u;
+shared float sW[64][KB + 1u]; // [64][17]
+shared float sX[KB][64];      // [16][64]
+#endif
+
+// Load one X element for conv_t2d, indexed by gk' (reduction index,
+// kh-major with ci innermost) and `col`, the output plane column
+// (col ∈ [0, H_out*W_out), h = col / W_out, w = col % W_out).
+// Returns 0 when gk' is past C_in*KH*KW, col past H_out*W_out, the
+// transposed-conv sampling maps outside the (segmented) input H window
+// (zero padding / output_padding border), or num%stride != 0 (the output
+// positions that match no (oh, kh) / (ow, kw) pair).
+float load_x(uint gk, uint col) {
+    if (gk >= pc.C_in * pc.KH * pc.KW || col >= pc.H_out * pc.W_out) return 0.0;
+    const uint ci = gk % pc.C_in;
+    const uint kw = (gk / pc.C_in) % pc.KW;
+    const uint kh = gk / (pc.C_in * pc.KW);
+    const uint h = col / pc.W_out; // segment-local output row (= h + ho_off absolute)
+    const uint w = col % pc.W_out;
+    const int num_h = int(h + pc.ho_off) + int(pc.ph) - int(kh);
+    if (num_h < 0) return 0.0;
+    if (num_h % int(pc.sh) != 0) return 0.0;
+    const int ih = num_h / int(pc.sh);
+    // Input window-relative row (bounds-check only; row stride stays pc.OH
+    // across the whole buffer, exactly like conv_t1d's `is` check).
+    const int is = ih - int(pc.in_off);
+    if (is < 0 || is >= int(pc.h_seg)) return 0.0;
+    const int num_w = int(w) + int(pc.pw) - int(kw);
+    if (num_w < 0) return 0.0;
+    if (num_w % int(pc.sw) != 0) return 0.0;
+    const int iw = num_w / int(pc.sw);
+    if (iw >= int(pc.OW)) return 0.0;
+    return x[(gl_WorkGroupID.z * pc.C_in + ci) * (pc.OH * pc.OW) + uint(ih) * pc.OW + uint(iw)];
+}
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x; // 0..15, col lane (Lo)
+    const uint ly = gl_LocalInvocationID.y; // 0..15, row lane (Co)
+    const uint tid = ly * 16u + lx;         // 0..255
+
+    // Workgroup -> TILE x TILE output tile (gl_WorkGroupID — never gid*N+lid).
+    const uint tc = gl_WorkGroupID.x;       // Lo tile col (plane col)
+    const uint tr = gl_WorkGroupID.y;       // Co tile row
+    const uint loBase = tc * uint(RVC_TILE);
+    const uint coBase = tr * uint(RVC_TILE);
+
+    const uint Kdim = pc.C_in * pc.KH * pc.KW; // total reduction length
+
+#if RVC_TILE == TILE_16
+    float acc = 0.0;
+#else
+    float acc[RPT][RPT];
+    for (uint i = 0u; i < RPT; i++)
+        for (uint j = 0u; j < RPT; j++)
+            acc[i][j] = 0.0;
+#endif
+
+    for (uint kt = 0u; kt < Kdim; kt += KB) {
+        // ── Load W tile: sW[TILE][16], TILE*16 elems, RPT per thread ──
+        // sW[r][cc] = w[ci, co, kh, kw] with (ci,kw,kh) = decode(gk' = kt+cc).
+        // (No vec4: consecutive gk' are C_out*KH*KW floats apart in memory.)
+        for (uint t = 0u; t < RPT; t++) {
+            const uint e = tid + t * 256u;  // 0..TILE*16-1
+            const uint r = e >> 4u;         // co row in tile
+            const uint cc = e & 15u;        // gk' col in block
+            const uint co = coBase + r;
+            const uint gk = kt + cc;
+            if (co < pc.C_out && gk < Kdim) {
+                const uint ci = gk % pc.C_in;
+                const uint kw = (gk / pc.C_in) % pc.KW;
+                const uint kh = gk / (pc.C_in * pc.KW);
+                sW[r][cc] = w[(ci * pc.C_out + co) * (pc.KH * pc.KW) + kh * pc.KW + kw];
+            } else {
+                sW[r][cc] = 0.0;
+            }
+        }
+        // ── Load X tile: sX[16][TILE], 16*TILE elems, RPT per thread ──
+        // (No vec4: stride>1 maps consecutive plane cols to non-consecutive
+        // input rows/cols with per-element divisibility checks.)
+        for (uint t = 0u; t < RPT; t++) {
+            const uint e = tid + t * 256u;  // 0..16*TILE-1
+            const uint k = e / uint(RVC_TILE);   // gk' row in block (0..15)
+            const uint cc = e - k * uint(RVC_TILE); // Lo col in tile
+            sX[k][cc] = load_x(kt + k, loBase + cc);
+        }
+        barrier();
+
+        // ── Accumulate: thread's RPT x RPT output block ──
+        // gk' order within the block is cc=0..15, and kt steps by 16 —
+        // monotonically increasing gk' = (kh, kw, ci) kh-major, identical
+        // to conv_t1d's (k, ci) nesting -> consistent float accumulation.
+        for (uint kk = 0u; kk < KB; kk++) {
+            for (uint i = 0u; i < RPT; i++) {
+                const float av = sW[ly * RPT + i][kk];
+                for (uint j = 0u; j < RPT; j++) {
+#if RVC_TILE == TILE_16
+                    acc += av * sX[kk][lx];
+#else
+                    acc[i][j] += av * sX[kk][lx * RPT + j];
+#endif
+                }
+            }
+        }
+        barrier(); // protect sW/sX until every lane is done reading
+    }
+
+    // ── Write output (WorkGroupID-derived indices — safe index form) ──
+    // Output plane stride = H_out_full * W_out (whole buffer), absolute
+    // plane offset = ho_off * W_out + lo (segment = whole plane -> 0 + lo).
+#if RVC_TILE == TILE_16
+    const uint co = coBase + ly;
+    const uint lo = loBase + lx;
+    if (co < pc.C_out && lo < pc.H_out * pc.W_out) {
+        float v = acc;
+        if (pc.has_bias == 1u) v += b[co];
+        out_data[(gl_WorkGroupID.z * pc.C_out + co) * (pc.H_out_full * pc.W_out) + (pc.ho_off * pc.W_out + lo)] = v;
+    }
+#else
+    for (uint i = 0u; i < RPT; i++) {
+        const uint co = coBase + ly * RPT + i;
+        if (co >= pc.C_out) break;
+        const float bv = (pc.has_bias == 1u) ? b[co] : 0.0;
+        for (uint j = 0u; j < RPT; j++) {
+            const uint lo = loBase + lx * RPT + j;
+            if (lo >= pc.H_out * pc.W_out) break;
+            out_data[(gl_WorkGroupID.z * pc.C_out + co) * (pc.H_out_full * pc.W_out) + (pc.ho_off * pc.W_out + lo)] = acc[i][j] + bv;
+        }
+    }
+#endif
+}

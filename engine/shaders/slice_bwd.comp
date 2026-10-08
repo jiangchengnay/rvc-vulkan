@@ -1,0 +1,44 @@
+// Slice along axis=1 (channel dim) — one shader, two modes:
+//   输入 x [B, C_in, T]，切片 [start, start+C_out) 沿 C 轴。
+//   mode 0 (fwd): out[b,c,t] = x[b, start+c, t]，out [B, C_out, T]
+//   mode 1 (bwd): gx[b,c,t] = (start<=c<start+C_out) ? go[b, c-start, t] : 0
+//                 gx [B, C_in, T]，go [B, C_out, T]（scatter，不重叠）
+// 沿 axis=1 切片/散射。逐元素一线程。
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // fwd: x; bwd: go
+layout(set = 0, binding = 1) buffer BO { float o[]; };            // fwd: out; bwd: gx
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C_in;
+    uint C_out;
+    uint T;
+    uint start;
+    uint mode;
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (pc.mode == 0u) {
+        const uint total = pc.B * pc.C_out * pc.T;
+        if (idx >= total) return;
+        const uint t = idx % pc.T;
+        const uint c = (idx / pc.T) % pc.C_out;
+        const uint b = idx / (pc.T * pc.C_out);
+        o[idx] = x[(b * pc.C_in + pc.start + c) * pc.T + t];
+    } else {
+        const uint total = pc.B * pc.C_in * pc.T;
+        if (idx >= total) return;
+        const uint t = idx % pc.T;
+        const uint c = (idx / pc.T) % pc.C_in;
+        const uint b = idx / (pc.T * pc.C_in);
+        float v = 0.0;
+        if (c >= pc.start && c < pc.start + pc.C_out) {
+            v = x[(b * pc.C_out + (c - pc.start)) * pc.T + t];
+        }
+        o[idx] = v;
+    }
+}

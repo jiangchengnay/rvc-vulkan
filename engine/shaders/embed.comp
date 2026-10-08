@@ -1,0 +1,30 @@
+// Embedding lookup (pure gather): out[N, EmbDim] = table[ids[N], :]
+//
+// ids are int32 non-negative indices, uploaded as raw bytes (each int32
+// occupies one f32 slot; the engine treats buffers as opaque bytes, so the
+// Python layer uploads ids.astype(int32).view(float32)). The shader reads
+// them as uints. Out-of-range ids must be rejected by the caller (the Python
+// layer validates ids before calling, else falls back to numpy).
+//
+// One thread per output element, flat 1D indexing (AMD gid.x-only trick).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BID { uint ids[]; };   // [N] int32 as raw bytes
+layout(set = 0, binding = 1) readonly buffer BT { float table[]; }; // [TableRows, EmbDim]
+layout(set = 0, binding = 2) buffer BO { float out_data[]; };       // [N, EmbDim]
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint EmbDim;
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.N * pc.EmbDim) return;
+
+    const uint row = idx / pc.EmbDim;
+    const uint col = idx % pc.EmbDim;
+    out_data[idx] = table[ids[row] * pc.EmbDim + col];
+}

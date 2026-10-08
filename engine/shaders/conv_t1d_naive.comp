@@ -1,0 +1,76 @@
+// 1D transposed convolution (conv_transpose1d) — 朴素点对点 kernel（原版，回退开关）。
+//   out[B, C_out, L_out] = convT(x[B, C_in, L], w[C_in, C_out, K]) + b[C_out]
+// with PyTorch weight layout [C_in, C_out, K].
+//
+// 保留作 RVC_CONV_T1D_TILE=0 的回退（新默认 = conv_t1d.comp TILE 模板
+// conv_t1d16/32/64）。数值为 TILE 版的对齐基准：累加顺序 (kk=K 外层, c=C_in 内层)。
+//
+// One thread per output point, flat 1D indexing (same trick as conv1d.comp:
+// only gl_GlobalInvocationID.x is used — never gid.x*N+lid.x, which misbehaves
+// on AMD Radeon Pro VII where only the lid.x==0 lane of each group writes).
+//
+// L_out = (L-1)*stride - 2*padding + dil*(K-1) + output_padding + 1
+//
+// For each output position lo, an input position i contributes via kernel tap
+// k when lo = i*stride - padding + k*dil, i.e. num = lo + padding - k*dil is
+// non-negative, divisible by stride, and num/stride < L. Positions covered by
+// output_padding simply match no (i, k) pair and stay bias-only (or zero).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [B, C_in, L]
+layout(set = 0, binding = 1) readonly buffer BW { float w[]; };   // [C_in, C_out, K]
+layout(set = 0, binding = 2) readonly buffer BB { float b[]; };   // [C_out] (unused when has_bias==0)
+layout(set = 0, binding = 3) buffer BO { float out_data[]; };     // [B, C_out, L_out]
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C_in;
+    uint L;
+    uint C_out;
+    uint K;
+    uint stride;
+    uint padding;
+    uint output_padding;
+    uint dil;
+    uint L_out;
+    uint has_bias;
+    uint in_off;   // T1.1 分段：输入窗口起始列（绝对）；整段=0
+    uint l_seg;    // T1.1 分段：输入窗口长度（仅边界检查，整段=L）
+    uint lo_off;   // T1.1 分段：输出段起始列（绝对）；整段=0
+    uint L_out_full; // T1.1 分段：输出全长行步长（段内寻址用）；整段=L_out
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.B * pc.C_out * pc.L_out) return;
+
+    // Decode flat output index -> (batch, out_channel, out_position)
+    const uint lo = idx % pc.L_out;
+    const uint t  = idx / pc.L_out;
+    const uint o  = t % pc.C_out;
+    const uint bb = t / pc.C_out;
+
+    // 分段：lo 是段内输出位置，映射回绝对输出列（整段时 lo_off=0）
+    const uint lo_abs = lo + pc.lo_off;
+
+    float acc = 0.0;
+    for (uint kk = 0u; kk < pc.K; kk++) {
+        const int num = int(lo_abs) + int(pc.padding) - int(kk) * int(pc.dil);
+        if (num < 0) continue;
+        if (num % int(pc.stride) != 0) continue;
+        const int i = num / int(pc.stride);
+        // 输入窗口内相对列（仅边界检查；行步长仍用 pc.L 整 buffer）
+        const int is = i - int(pc.in_off);
+        if (is < 0 || is >= int(pc.l_seg)) continue;
+        for (uint c = 0u; c < pc.C_in; c++) {
+            acc += x[(bb * pc.C_in + c) * pc.L + uint(i)]
+                 * w[(c * pc.C_out + o) * pc.K + kk];
+        }
+    }
+    if (pc.has_bias == 1u) acc += b[o];
+
+    // 输出绝对位置（整 buffer 行步长 L_out_full）
+    out_data[(bb * pc.C_out + o) * pc.L_out_full + lo_abs] = acc;
+}

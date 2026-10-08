@@ -1,0 +1,45 @@
+// P15b: in-GPU stride-2 zero insertion (transposed-conv upsampling).
+//
+// out[C, 2H-1, 2W-1] = insert_zeros_2x(x[C, H, W]):
+//   out[c, i, j] = (i % 2 == 0 && j % 2 == 0) ? x[c, i/2, j/2] : 0.0
+//
+// Bit-identical to the host recipe `np.zeros((C,2H-1,2W-1)); out[:,:,::2,::2]=x`
+// (zeros are exact +0.0, original values are copied unchanged, nothing is
+// reordered), so feeding this buffer into the same conv2d kernel yields
+// byte-identical results to the host path (the conv accumulation order is
+// untouched). `C` is the merged channel count (B*C_in) — the flat buffer
+// layout [C, H, W] matches conv2d's [B, C_in, H, W] with C = B*C_in.
+//
+// One thread per output element, flat 1D indexing (AMD gid.x-only trick,
+// same as embed.comp). Grid: gx = ceilDiv(C*(2H-1)*(2W-1), 256).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [C, H, W]
+layout(set = 0, binding = 1) buffer BO { float out_data[]; };     // [C, 2H-1, 2W-1]
+
+layout(push_constant) uniform PC {
+    uint C;
+    uint H;
+    uint W;
+} pc;
+
+void main() {
+    const uint uw = (pc.W << 1u) - 1u;            // 2W-1 (W >= 1)
+    const uint uh = (pc.H << 1u) - 1u;            // 2H-1
+    const uint up = uw * uh;                      // (2H-1)*(2W-1) output plane
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.C * up) return;
+
+    const uint c = idx / up;
+    const uint rem = idx - c * up;
+    const uint j = rem / uw;
+    const uint k = rem - j * uw;
+
+    if (((j & 1u) != 0u) || ((k & 1u) != 0u)) {
+        out_data[idx] = 0.0;
+    } else {
+        out_data[idx] = x[c * (pc.H * pc.W) + (j >> 1u) * pc.W + (k >> 1u)];
+    }
+}

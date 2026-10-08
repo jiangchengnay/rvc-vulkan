@@ -1,0 +1,58 @@
+// 阶段E (C3 v2): in-GPU im2col for conv2d backward gw / forward —
+// replace host assembly (pad + sliding_window_view + transpose + reshape +
+// copy) with a GPU gather.
+//
+// Output row-major xw[B*OH*OW, C*KH*KW]:
+//   xw[row = b*OH*OW + oh*OW + ow, col = c*KH*KW + kh*KW + kw] =
+//       x[b, c, oh*sh - ph + kh, ow*sw - pw + kw]  (0.0 if outside [0,H)x[0,W))
+//
+// Row order (b,oh,ow) then (c,kh,kw) inside — matches the host recipe
+// `win.transpose(0,2,3,1,4,5).reshape(B*OH*OW, C*KH*KW)`. Bit-identical
+// (zeros exact +0.0, values copied unchanged). dilation must be 1.
+//
+// One thread per output element, flat 1D indexing. Grid: gx = ceilDiv(total,256).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };   // [B, C, H, W]
+layout(set = 0, binding = 1) buffer BO { float out_data[]; };     // [B*OH*OW, C*KH*KW]
+
+layout(push_constant) uniform PC {
+    uint B;
+    uint C;
+    uint H;
+    uint W;
+    uint OH;
+    uint OW;
+    uint KH;
+    uint KW;
+    uint sh;
+    uint sw;
+    uint ph;
+    uint pw;
+} pc;
+
+void main() {
+    const uint total = pc.B * pc.OH * pc.OW * pc.C * pc.KH * pc.KW;
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    const uint ckw = pc.C * pc.KH * pc.KW;   // per-row elements
+    const uint col = idx % ckw;
+    const uint row = idx / ckw;
+    const uint kw2 = col % pc.KW;
+    const uint kh2 = (col / pc.KW) % pc.KH;
+    const uint c2 = col / (pc.KH * pc.KW);
+    const uint ow2 = row % pc.OW;
+    const uint oh2 = (row / pc.OW) % pc.OH;
+    const uint b2 = row / (pc.OH * pc.OW);
+
+    const int ih = int(oh2) * int(pc.sh) - int(pc.ph) + int(kh2);
+    const int iw = int(ow2) * int(pc.sw) - int(pc.pw) + int(kw2);
+    if (ih < 0 || ih >= int(pc.H) || iw < 0 || iw >= int(pc.W)) {
+        out_data[idx] = 0.0;
+    } else {
+        out_data[idx] = x[((b2 * pc.C + c2) * pc.H + uint(ih)) * pc.W + uint(iw)];
+    }
+}

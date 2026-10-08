@@ -1,0 +1,18 @@
+# 贡献者
+
+## 本仓库（RVC-Vulkan，de-CUDA 移植）
+
+- RVC-Vulkan 移植与 Vulkan 引擎作者（见 git 提交历史）
+
+## 上游与第三方
+
+本仓库是以下项目的独立移植，其作者/贡献者同样应被致谢：
+
+- RVC-Project / Retrieval-based-Voice-Conversion-WebUI（MIT）
+  https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
+- ContentVec（MIT）  https://github.com/auspicious3000/contentvec
+- VITS（MIT）        https://github.com/jaywalnut310/vits
+- HiFi-GAN（MIT）    https://github.com/jik876/hifi-gan
+- RMVPE / FCPE 及其原始论文作者
+
+完整第三方许可清单见 `MIT协议暨相关引用库协议`。

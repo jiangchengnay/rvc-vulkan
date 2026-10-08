@@ -1,0 +1,51 @@
+// Gating kernel for flow WN — fused: c[i] = tanh(a[i]+g1) * sigmoid(a[i+n]+g2)
+//
+// Implements the flow WN gate:
+//   acts = tanh(x_in + g_l)[:, :hidden] * sigmoid((x_in + g_l)[:, hidden:])
+// x_in = [1, 2H, L] (conv1d output; first H channels = tanh branch, second H
+// = sigmoid branch), g_l = [1, 2H, Lg] (cond segment; Lg=1 broadcast or Lg=L).
+//
+// Flat layouts:
+//   a: [2H*L] — a[i] = tanh-branch in, a[i+n] = sigmoid-branch in (n = H*L)
+//   b: [2H*Lg]— b[b_idx] = tanh-branch cond, b[b_idx + H*Lg] = sigmoid-branch
+//               b_idx = (i/L)*Lg + (i%L)             when Lg == L
+//                       i/L                          when Lg == 1
+//   c: [H*L]  — out
+//
+// sigmoid as `x>=0 ? 1/(1+exp(-x)) : exp(x)/(1+exp(x))` (matches
+// runtime.nn.sigmoid branch-for-branch; GPU exp ~1ulp vs libm → documented
+// ~1e-7 delta, D5 precedent). Push: n, lg, h.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BB { float b[]; };
+layout(set = 0, binding = 2) buffer BC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint n;   // H*L output element count
+    uint lg;  // g time dim (1 or L)
+    uint h;   // hidden half = cfg.hidden // 2 (flow: 192)
+    uint off; // g segment start offset (elements), for layer i: i * 2H * lg
+} pc;
+
+float sigmoidf(float x) {
+    return x >= 0.0 ? 1.0 / (1.0 + exp(-x)) : exp(x) / (1.0 + exp(x));
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;  // 全局线性索引（已含 local，勿再乘 256）
+    if (i >= pc.n) return;
+    const uint L = pc.n / pc.h;  // h*L / h = L
+    const uint hlg = pc.h * pc.lg;
+    uint b_idx;
+    if (pc.lg == 1u) {
+        b_idx = pc.off + i / L;
+    } else {
+        b_idx = pc.off + (i / L) * pc.lg + (i % L);
+    }
+    const float g1 = b[b_idx];
+    const float g2 = b[b_idx + hlg];
+    c[i] = tanh(a[i] + g1) * sigmoidf(a[i + pc.n] + g2);
+}

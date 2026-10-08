@@ -1,0 +1,68 @@
+// Attention context (weighted sum) with HEAD-INTERLEAVED V layout:
+//   ctx[t, h*D + d] = sum_s attnW[h, t, s] * v[s, h*D + d]
+// attnW is [H, T, T] row-major (softmax output of attn_qk), v is [T, C]
+// with head h at columns [h*D, (h+1)*D); ctx out is [T, C] interleaved —
+// the transpose back from [H, T, D] is folded into the kernel, so the
+// out_proj matmul reads ctx directly (no merge-heads permutation).
+//
+// One 16x16 workgroup per (h, t-tile, d-tile): gx = ceil(D/16),
+// gy = ceil(T/16), gz = H. Inner reduction over s in 16-wide chunks with
+// shared tiles sW[16][16] (attnW block) and sV[16][16] (v block, strided
+// columns read once per chunk and reused by all 16 t-rows).
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { float w[]; };       // [H, T, T]
+layout(set = 0, binding = 1) readonly buffer BV { float v[]; };       // [T, C]
+layout(set = 0, binding = 2) buffer BO { float out_data[]; };         // [T, C]
+
+layout(push_constant) uniform PC {
+    uint H;
+    uint T;
+    uint D;   // head dim (<= 64)
+    uint C;   // = H * D
+} pc;
+
+shared float sW[16][16];
+shared float sV[16][16];
+
+void main() {
+    const uint h   = gl_GlobalInvocationID.z;
+    const uint t0  = gl_WorkGroupID.y * 16u;
+    const uint d0  = gl_WorkGroupID.x * 16u;
+    const uint lx  = gl_LocalInvocationID.x;
+    const uint ly  = gl_LocalInvocationID.y;
+    const uint tid = ly * 16u + lx;
+
+    const uint hd = h * pc.D;
+    const uint trow = t0 + ly;
+    const uint dcol = d0 + lx;
+
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.T; s += 16u) {
+        // attnW tile: rows t0..t0+15 x cols s..s+15 (row stride T).
+        for (uint e = tid; e < 256u; e += 256u) {
+            const uint r = e >> 4u;
+            const uint c = e & 15u;
+            const uint tt = t0 + r;
+            const uint ss = s + c;
+            sW[r][c] = (tt < pc.T && ss < pc.T)
+                       ? w[h * pc.T * pc.T + tt * pc.T + ss] : 0.0;
+        }
+        // v tile: rows s..s+15 x cols d0..d0+15 of head h (column-strided).
+        for (uint e = tid; e < 256u; e += 256u) {
+            const uint r = e >> 4u;
+            const uint c = e & 15u;
+            const uint ss = s + r;
+            const uint dd = d0 + c;
+            sV[r][c] = (ss < pc.T && dd < pc.D) ? v[ss * pc.C + hd + dd] : 0.0;
+        }
+        barrier();
+        for (uint c = 0u; c < 16u; c++) acc += sW[ly][c] * sV[c][lx];
+        barrier();
+    }
+    if (trow < pc.T && dcol < pc.D) {
+        out_data[trow * pc.C + hd + dcol] = acc;
+    }
+}

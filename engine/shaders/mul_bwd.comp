@@ -1,0 +1,22 @@
+// mul backward — one shader, two modes (BatchEntry binds <=4 buffers):
+//   mode 0: ga = go * b   (a 的梯度)
+//   mode 1: gb = go * a   (b 的梯度)
+// 逐元素一线程（f32）。
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BGO { float go[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };  // a 或 b
+layout(set = 0, binding = 2) buffer BD { float dst[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint mode;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    dst[i] = go[i] * x[i];
+}
