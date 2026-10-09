@@ -1,0 +1,18 @@
+RVC-Vulkan
+Copyright (c) 2026 RVC-Vulkan contributors
+
+本软件以 MIT 协议发布（见 LICENSE）。本仓库是以下项目的独立移植与重写，
+在此致谢上游及第三方（其许可协议详见 MIT协议暨相关引用库协议）：
+
+- RVC-Project / Retrieval-based-Voice-Conversion-WebUI (MIT License)
+  https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
+  Copyright (c) 2023 liujing04
+  Copyright (c) 2023 源文雨
+  Copyright (c) 2023 Ftps
+
+- ContentVec (MIT License)  https://github.com/auspicious3000/contentvec
+- VITS (MIT License)        https://github.com/jaywalnut310/vits
+- HiFi-GAN (MIT License)    https://github.com/jik876/hifi-gan
+- RMVPE / FCPE 及其原始论文作者
+
+本仓库与上述上游项目无官方从属或背书关系。

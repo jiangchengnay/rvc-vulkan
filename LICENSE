@@ -1,14 +1,6 @@
 MIT License
 
-Copyright (c) 2026 RVC-Vulkan contributors (de-CUDA port & Vulkan engine)
-
---- Upstream attribution ---
-This project is an independent port/rewrite of:
-  RVC-Project / Retrieval-based-Voice-Conversion-WebUI (MIT License)
-  Copyright (c) 2023 liujing04
-  Copyright (c) 2023 源文雨
-  Copyright (c) 2023 Ftps
-See "MIT协议暨相关引用库协议" for the full list of third-party licenses.
+Copyright (c) 2026 RVC-Vulkan contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
