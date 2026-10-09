@@ -16,5 +16,9 @@
 *.wav binary
 *.dll binary
 
-# 语言统计：文档不计入
+# 语言标注（让 GitHub 正确统计引擎代码）
+*.comp linguist-language=GLSL
+*.zig  linguist-language=Zig
+
+# 文档不计入语言统计
 *.md linguist-documentation

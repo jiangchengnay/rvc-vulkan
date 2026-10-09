@@ -5,7 +5,11 @@
 
 # RVC-Vulkan
 
-**去 CUDA / PyTorch 的 RVC 变声推理（纯 numpy + 原生 Vulkan 计算后端）**
+**去 CUDA / PyTorch 的 RVC 变声（推理 + 训练）——纯 numpy + 原生 Vulkan 计算后端**
+
+> **语言构成**：Python（运行时：纯 numpy 推理/训练）+ **Zig 0.14 / GLSL**（原生
+> Vulkan 计算引擎 `engine/`，编译为 `rvc_core.dll`）。GitHub 主语言显示为
+> Python 是因其占代码量多数，核心 GPU 引擎为 Zig + GLSL。
 
 > ⚠️ **第三方个人项目声明**：本仓库是基于
 > [RVC-Project/Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
