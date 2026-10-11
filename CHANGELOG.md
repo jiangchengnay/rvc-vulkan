@@ -2,6 +2,33 @@
 
 本项目遵循语义化版本（`主.次.修订`）。日期格式 YYYY-MM-DD。
 
+## [0.0.2] - 2026-10-12
+
+修复全链路审计（RVC-Audit2）发现的 13 个缺陷，全部经复现验证 + 测试套件回归。
+
+### 修复
+- **推理正确性**
+  - conv_transpose1d 时间维切分在 `output_padding≠0` 时输出错位（长音频触发）。
+  - FCPE `_decode` 在 latent 全零时 `0/0` 产生 NaN（分母保护 + 规避 `0*inf`）。
+  - `change_rms` 对空输出音频除零崩溃。
+- **检索**
+  - `_IVF_D2_CACHE` 仅按 shape 缓存，同形不同内容索引检索错误。
+  - IP（内积）索引被当作 L2 检索——现显式拒绝（与写侧对称）。
+- **训练**
+  - AutogradTape 输入 dtype ≠ tape dtype 时梯度静默丢失（参数不更新）。
+  - SmartSampler"段最优"保存的是权重引用而非快照 → 落盘成最新权重。
+- **并发**
+  - `set_clarity_mix` 模块全局在并发请求间串味（改 thread-local）。
+- **文档/测试基建**
+  - `BatchTensor.numpy` docstring 与实现矛盾；`_alloc_output` docstring 默认值不符实现。
+  - 训练冒烟用例因 `max_frames/lock_frames` 不自洽而长期假绿（从未真跑）。
+  - 多个测试套件依赖未随仓库提供的音频资产（新增自包含生成）。
+
+### 验证
+- 核心测试套件全绿：backend 86/0、nn_backward 36/36、faiss_reader 36/36、
+  vits_train 24/24（训练冒烟真跑通）、weightnorm_train 15/15、
+  backward_gpu_f64 10/10、pipeline/vc/persistent/e2e 全 PASS。
+
 ## [0.0.1] - 2026-10-09
 
 首个公开版本：RVC（变声/音色转换）的去 CUDA 移植 —— 纯 numpy + 原生 Vulkan 后端。
