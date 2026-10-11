@@ -372,6 +372,17 @@ class VC:
             # 形状不一致崩）；free_all 后切换正常（实测 11.07s 6s pm）。
             from runtime import vulkan_weights as _vw  # noqa: PLC0415
             _vw._weights.free_all()
+            # 多模型切换修复（2026-10-09）：free_all 清了常驻 GPU 权重，但
+            # vits/hubert/rmvpe 的实例缓存（_load_cache/_cache/_CACHE）会复用
+            # 旧实例，其内部 _wn_cache/_thirds_cache 等 GPU 常驻句柄已失效
+            # → 切模型后形状错位（add_inplace a=(1,256,12592) b=(1,256,12600)）。
+            # 切模型时清空三者实例缓存，强制重建（全新状态，代价可接受）。
+            from runtime.models import vits as _vits  # noqa: PLC0415
+            from runtime.models import hubert as _hub  # noqa: PLC0415
+            from runtime.models import rmvpe as _rmv  # noqa: PLC0415
+            _vits._load_cache.clear()
+            _hub._cache.clear()
+            _rmv._CACHE.clear()
             self.net_g = load_synthesizer(path)
             self.pipeline = Pipeline(self.tgt_sr, self.config)
 

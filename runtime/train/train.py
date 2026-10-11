@@ -644,9 +644,13 @@ def _cat_batch(items, cfg: SamplingConfig):
     # ⇒ _enc_cache 出现两个 key（条目 4 而非 3）⇒ 违背「每族 1 key」靶标。
     # 锁定生效后 minF ≡ T0 恒定 ⇒ 该 bug 从「偶发」变「每步必现」，
     # 与 BLOCK-4 强联动，必须同批修改。
+    # 修正（2026-10-09）：pitch/pitchf 帧轴与 phone 相同（=2T，见 aligned
+    # 里 phone=repeat(feat,2) 且 pitch=f0 同长），batch>1 必须同样切
+    # [:2*minF]。原 [:minF] 把 pitch 腰斩成 T，与 phone 的 2T 不匹配
+    # → enc_p 形状冲突 → batch>1 训练崩溃（只能 batch=1，慢 3 倍）。
     out["phone"] = np.stack([it["phone"][0][:2 * minF] for it in items])
-    out["pitch"] = np.stack([it["pitch"][0][:minF] for it in items])
-    out["pitchf"] = np.stack([it["pitchf"][0][:minF] for it in items])
+    out["pitch"] = np.stack([it["pitch"][0][:2 * minF] for it in items])
+    out["pitchf"] = np.stack([it["pitchf"][0][:2 * minF] for it in items])
     out["spec"] = np.stack([it["spec"][0][..., :minF] for it in items])
     out["spec_mel"] = np.stack([it["spec_mel"][0][..., :minF] for it in items])
     out["wave"] = np.stack([it["wave"][0][:minF * cfg.hop] for it in items])

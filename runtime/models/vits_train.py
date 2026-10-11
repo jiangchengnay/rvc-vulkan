@@ -2328,6 +2328,26 @@ def _enc_split_heads(q_np, k_np, v_np, B, H, kc, P, inv_sqrt_kc):
     return qh, khT, vh, qs
 
 
+def _get_relative_embeddings_tape(tape, emb_rel, length, window_size):
+    """tape 可导版 _get_relative_embeddings（梯度回传 emb_rel）。
+
+    2026-10-10 修复（架构级）：原 _get_relative_embeddings 用 np.pad + 切片，
+    返回 numpy 数组脱离 tape → enc_p.encoder.attn_layers.*.emb_rel_k/v
+    （相对位置编码，负责时序/韵律建模）永远零梯度（实测正版变化 0.05~0.21，
+    我这边 0.00000）→ 学不会目标说话人的发音节奏，听感不对。
+    现在：emb_rel 经 identity 引入 tape，pad/slice 走 tape 算子，梯度回传。
+
+    对齐 vits._get_relative_embeddings：emb_rel [1, 2w+1, k] → [1, 2L-1, k]。
+    """
+    emb = tape.mul_const(np.asarray(emb_rel), 1.0)   # identity 引入 tape 节点
+    pad_length = max(length - (window_size + 1), 0)
+    slice_start = max((window_size + 1) - length, 0)
+    slice_end = slice_start + 2 * length - 1
+    if pad_length > 0:
+        emb = tape.pad_const(emb, pad_length, pad_length, axis=1)
+    return tape.slice(emb, slice_start, slice_end, axis=1)   # [1, 2L-1, k]
+
+
 class TextEncoderTrain:
     def __init__(self, w: dict, cfg: VitsConfig):
         self.w = w
@@ -2380,7 +2400,7 @@ class TextEncoderTrain:
               else tape.einsum("bhqd,bhkd->bhqk", qs, kh))
             emb_k = np.asarray(w[
                 f"enc_p.encoder.attn_layers.{i}.emb_rel_k"])
-            used_k = _get_relative_embeddings(emb_k, P, window_size=10)[0]
+            used_k = _get_relative_embeddings_tape(tape, emb_k, P, window_size=10)
             rel_logits = (tape.matmul(qs, used_k, trans_b=True) if _mmq_on
                   else tape.einsum("bhqd,md->bhqm", qs, used_k))
             scores = tape.add(scores, _rel_to_abs(tape, rel_logits, P))
@@ -2392,7 +2412,7 @@ class TextEncoderTrain:
            else tape.einsum("bhqk,bhkd->bhqd", p_attn, vh))
             emb_v = np.asarray(w[
                 f"enc_p.encoder.attn_layers.{i}.emb_rel_v"])
-            used_v = _get_relative_embeddings(emb_v, P, window_size=10)[0]
+            used_v = _get_relative_embeddings_tape(tape, emb_v, P, window_size=10)
             rel_w = _abs_to_rel(tape, p_attn, P)
             out = tape.add(out, (tape.matmul(rel_w, used_v) if _mmq_on
                       else tape.einsum("bhqm,md->bhqd", rel_w, used_v)))
@@ -2532,11 +2552,11 @@ class TextEncoderTrain:
             vh = [[tape.transpose(vg[b][h], (1, 0))
                    for h in range(H)] for b in range(B)]
             emb_k = np.asarray(w[wp + "emb_rel_k"])
-            used_k = _get_relative_embeddings(emb_k, P, window_size=10)[0]
+            used_k = _get_relative_embeddings_tape(tape, emb_k, P, window_size=10)
             used_kT = np.ascontiguousarray(np.asarray(used_k, np.float32).T)
             emb_v = np.asarray(w[wp + "emb_rel_v"])
             used_v = np.ascontiguousarray(np.asarray(
-                _get_relative_embeddings(emb_v, P, window_size=10)[0],
+                _get_relative_embeddings_tape(tape, emb_v, P, window_size=10),
                 np.float32))
             # -- S2：每 bh scores=qs×khT、rel=qs×used_kT --
             scs = [[None] * H for _ in range(B)]
@@ -2756,11 +2776,11 @@ class TextEncoderTrain:
             ffn = f"enc_p.encoder.ffn_layers.{i}."
             # 每层相对位置嵌入 → 共享槽覆写
             emb_k = np.asarray(w[wp + "emb_rel_k"])
-            used_k = _get_relative_embeddings(emb_k, P, window_size=10)[0]
+            used_k = _get_relative_embeddings_tape(tape, emb_k, P, window_size=10)
             used_kT = np.ascontiguousarray(np.asarray(used_k, np.float32).T)
             emb_v = np.asarray(w[wp + "emb_rel_v"])
             used_v = np.ascontiguousarray(np.asarray(
-                _get_relative_embeddings(emb_v, P, window_size=10)[0],
+                _get_relative_embeddings_tape(tape, emb_v, P, window_size=10),
                 np.float32))
             gr.set_input(used_kT, dg.slots["used_kT"])
             gr.set_input(used_v, dg.slots["used_v"])
@@ -3327,8 +3347,17 @@ class GeneratorNSFTrain:
                     ResBlock1Train(w, f"dec.resblocks.{i * 3 + j}", ch, ks))
         self.conv_post_w = np.asarray(w["dec.conv_post.weight"])
 
-    def sine_gen(self, f0, ns):
-        """SineGen + m_source（与 vits._sine_gen 完全一致，无梯度）。"""
+    def sine_gen(self, tape, f0, ns):
+        """SineGen + m_source（谐波激励源）—— l_linear 走 tape（可训练）。
+
+        2026-10-10 修复（架构级）：此前整段纯 numpy（docstring 原写"无梯度"），
+        导致 dec.m_source.l_linear 永远停在底模（实测 4100 步变化 0.00000，
+        而正版 gan1 变化 0.372）→ 激励源是**固定谐波模板** → 齿音"极其规整
+        平滑、像画出来的"，听感发糊、音色不对（用户实测定位）。正版 RVC 里
+        SourceModuleHnNSF.l_linear 是生成器可训练层，必须给梯度。
+        现在：sine/uv/noise（无参数的相位+噪声计算）仍为 numpy 常量；只有
+        l_linear（Linear 1→1）+ tanh 走 tape，梯度回传 l_linear.weight/bias。
+        """
         cfg = self.cfg
         upp = cfg.upp
         sr = cfg.sr
@@ -3344,17 +3373,22 @@ class GeneratorNSFTrain:
         uv = np.repeat(uv, upp, axis=1)
         noise_amp = uv * 0.003 + (1 - uv) * 0.1 / 3
         noise = noise_amp * ns
-        sine = sine * uv + noise
+        sine = (sine * uv + noise).astype(np.float32)   # [B, T', 1] 常量（无参数）
         w = self.w
-        l_lin = sine @ np.asarray(w["dec.m_source.l_linear.weight"]).T \
-            + np.asarray(w["dec.m_source.l_linear.bias"])
-        return np.tanh(l_lin).transpose(0, 2, 1).astype(np.float32)
+        lw = np.asarray(w["dec.m_source.l_linear.weight"])   # [1, 1]
+        lb = np.asarray(w["dec.m_source.l_linear.bias"])     # [1]
+        # l_linear 走 tape：梯度回传 lw/lb（对齐正版 SourceModuleHnNSF 可训练语义）
+        l_lin = tape.linear(sine, lw, lb)                    # [B, T', 1]
+        out = tape.tanh(l_lin)                               # [B, T', 1]
+        return tape.transpose(out, (0, 2, 1))                # [B, 1, T']
 
     def forward(self, tape, z, f0, g, ns):
         """z: [B, 192, Tf]；f0: [B, Tf]；g: [B, 256, 1]；ns 噪声。"""
         cfg = self.cfg
-        har = self.sine_gen(f0, ns)  # 常量（detach）
-        tape.mark_const(har)
+        # 2026-10-10 修复：har 现在经 tape.linear/tanh 产生（l_linear 可训练），
+        # 是**带梯度**的 tape 张量，不能再 mark_const（否则 l_linear 断链）。
+        # sine/uv/noise（相位+噪声，无参数）仍为常量，梯度只回传 l_linear。
+        har = self.sine_gen(tape, f0, ns)
         import os as _os  # noqa: PLC0415
         # T3-c：dec 前向整链单图执行（RVC_TRAIN_GRAPH_DEC=1，默认 0 零回归）。
         # 优先级高于 BR_FWD_DEC 门：图化后 forward_graph 内部不再走 _forward_br。
