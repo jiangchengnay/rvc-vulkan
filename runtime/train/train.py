@@ -482,8 +482,7 @@ class _FullSample:
 
         return dict(phone=phone[None], pitch=pitch[None], pitchf=pitchf[None],
                     spec=spec, spec_mel=mel, wave=audio, spec_lengths=n_min,
-                    spec_lengths_real=spec_lengths_real,
-                    ref_mel=self.ref_mel)
+                    spec_lengths_real=spec_lengths_real)
 
 
 # ---------------------------------------------------------------------------
@@ -655,11 +654,6 @@ def _cat_batch(items, cfg: SamplingConfig):
     out["spec_mel"] = np.stack([it["spec_mel"][0][..., :minF] for it in items])
     out["wave"] = np.stack([it["wave"][0][:minF * cfg.hop] for it in items])
     out["spec_lengths"] = np.array([minF] * len(items), dtype=np.int64)
-    # P0：参考音色 mel（batch 内统一到最短参考长度，保证可 stack）。
-    if all("ref_mel" in it for it in items):
-        rmin = min(int(it["ref_mel"].shape[-1]) for it in items)
-        out["ref_mel"] = np.stack(
-            [it["ref_mel"][0][..., :rmin] for it in items])
     return out
 
 
