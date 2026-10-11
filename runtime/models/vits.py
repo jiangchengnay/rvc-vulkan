@@ -96,19 +96,27 @@ _ENC_FULLGPU_FLAG = os.environ.get("RVC_VITS_ENCP_FULLGPU", "1") != "0"
 #   中间值 → 线性混合过渡。实现：conv_o 是 (192,192,1) 逐点卷积，推理期
 #   合成权重 W' = mix*W + (1-mix)*I、b' = mix*b（精确等价部分投影），
 #   保持 T16 全 GPU 流转不破坏；env RVC_VITS_CLARITY_MIX 或 API 设置。
-_ENC_CLARITY_MIX = float(os.environ.get("RVC_VITS_CLARITY_MIX", "1.0"))
-_ENC_CLARITY_MIX = max(0.0, min(1.0, _ENC_CLARITY_MIX))
+# BUG-007：clarity_mix 是**每请求参数**（WebUI/API 可各自指定），旧实现用
+# 模块级全局 _ENC_CLARITY_MIX，FastAPI 线程池并发处理请求时会互相覆盖
+# （请求 A 设 0.2、B 设 1.0 → A 的推理可能读到 1.0）→ 静默串味。
+# 改为 thread-local：每个请求线程独立持有；未设置时回退环境默认值。
+_ENC_CLARITY_MIX_DEFAULT = float(os.environ.get("RVC_VITS_CLARITY_MIX", "1.0"))
+_ENC_CLARITY_MIX_DEFAULT = max(0.0, min(1.0, _ENC_CLARITY_MIX_DEFAULT))
+_ENC_CLARITY_TLS = threading.local()
 
 
 def set_clarity_mix(mix: float) -> None:
-    """运行时设置说话清晰度混合（0~1）。供 WebUI/API 调用，默认 1.0。"""
-    global _ENC_CLARITY_MIX
-    _ENC_CLARITY_MIX = max(0.0, min(1.0, float(mix)))
+    """运行时设置说话清晰度混合（0~1）。供 WebUI/API 调用，默认 1.0。
+
+    BUG-007：写入 **thread-local**（当前线程），不再改模块全局——使并发
+    请求各自隔离，互不串味。
+    """
+    _ENC_CLARITY_TLS.value = max(0.0, min(1.0, float(mix)))
 
 
 def get_clarity_mix() -> float:
-    """当前清晰度混合值（默认 1.0=完整 conv_o 修复）。"""
-    return _ENC_CLARITY_MIX
+    """当前线程的清晰度混合值（未设置则回退环境默认，默认 1.0）。"""
+    return getattr(_ENC_CLARITY_TLS, "value", _ENC_CLARITY_MIX_DEFAULT)
 
 # D6：flow（ResidualCouplingBlock 逆变换）GPU 化总开关。``RVC_VITS_FLOW_GPU=0``
 # 关闭（回退 numpy 门控路径，零回归对照）；默认开启，仅 vulkan 后端（flow
@@ -741,7 +749,7 @@ class _TextEncoder:
                 # ── conv_o（转回 [1,h,P]）→ 残差 ──
                 attnT = br.transpose(cw, P, h, out_shape=(1, h, P))
                 br.tensor_done(cw)
-                mix = _ENC_CLARITY_MIX
+                mix = get_clarity_mix()
                 if mix >= 1.0:
                     # 默认：完整 conv_o 投影（B5 修复，清晰，零回归——常驻权重）
                     ao = br.conv1d(

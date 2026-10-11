@@ -140,6 +140,14 @@ class FeatureIndex:
         return self._vectors[start:start + n].copy()
 
     def search(self, query: np.ndarray, k: int = 8):
+        # BUG-012：旧实现恒走 search_l2，忽略 self.metric——IP（内积）索引被
+        # 当成 L2 检索，返回错误近邻（静默）。RVC 检索链的 (1/score)^2 加权是
+        # L2 距离语义，IP 无法正确使用；与 faiss_writer 写侧铁律（拒绝 IP）
+        # 对称，读侧也显式拒绝，绝不静默给错。
+        if str(getattr(self, "metric", "L2")).upper() == "IP":
+            raise NotImplementedError(
+                "FeatureIndex 不支持 IP（内积）度量检索：RVC 检索链的 (1/score)^2 "
+                "加权为 L2 距离语义（P-RET-001/002）。请改用 L2 索引。")
         return search_l2(np.asarray(query, dtype=np.float32), self._vectors, k=k)
 
     def save(self, path: str) -> None:

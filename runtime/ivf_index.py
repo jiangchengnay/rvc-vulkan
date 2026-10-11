@@ -310,6 +310,11 @@ class IVFIndex:
         Returns:
             (scores [F, k] float32 升序, inds [F, k] int64 全局行号)。
         """
+        # BUG-012：与 FeatureIndex 同理——IP 度量显式拒绝（RVC 检索链为 L2 语义）。
+        if str(getattr(self, "metric", "L2")).upper() == "IP":
+            raise NotImplementedError(
+                "IVFIndex 不支持 IP（内积）度量检索：RVC 检索链的 (1/score)^2 "
+                "加权为 L2 距离语义（P-RET-001/002）。请改用 L2 索引。")
         query = np.asarray(query, dtype=np.float32)
         if query.ndim != 2:
             raise ValueError(f"query 需要 [F, D] 输入，实际 {query.ndim}D")

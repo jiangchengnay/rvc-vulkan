@@ -58,7 +58,9 @@ _K_SEARCH = 8
 _HUBERT_LN_EPS = 1e-5
 
 
-_IVF_D2_CACHE: dict = {}  # T15：桶向量 L2 范数缓存（vecs.shape -> d2[vecs 行数]）
+# T15：桶向量 L2 范数缓存。BUG-003 修复：键为 (id(vecs), shape) 并持引用，
+# 避免"同形状不同内容"的索引互相命中（旧键 vecs.shape 会导致检索静默错）。
+_IVF_D2_CACHE: dict = {}
 
 
 def _ivf_strict_search(index, query, k=8, nprobe=None):
@@ -78,6 +80,12 @@ def _ivf_strict_search(index, query, k=8, nprobe=None):
 
     Returns: (scores [F,k] f32 升序, indices [F,k] int64 全局行号)
     """
+    # BUG-012：IP 度量显式拒绝（与 FeatureIndex/IVFIndex.search 一致；RVC
+    # 检索链为 L2 语义，IP 索引无法正确加权）。
+    if str(getattr(index, "metric", "L2")).upper() == "IP":
+        raise NotImplementedError(
+            "检索不支持 IP（内积）度量索引：RVC 检索链的 (1/score)^2 加权为 "
+            "L2 距离语义（P-RET-001/002）。请改用 L2 索引。")
     if nprobe is None:
         nprobe = getattr(index, "nprobe", 1) or 1
     F = query.shape[0]
@@ -107,12 +115,20 @@ def _ivf_strict_search(index, query, k=8, nprobe=None):
         # 桶 L2 范数缓存（同进程内 vecs 不变；dict[桶行号集 -> d2] 避免
         # 每行重算 search_l2 的 d2 einsum —— 桶重复行频率通常很低，用
         # 全量 d2 一次计算 + 子集索引更省（74606 点 einsum ~1ms/调用）。
-        d2 = _IVF_D2_CACHE.get(vecs.shape)
-        if d2 is None:
+        # BUG-003 修复：旧键 vecs.shape 无法区分"同形状不同内容"的向量集，
+        # 进程内先后用两个同形索引（不同模型/说话人）会命中错误 d2 →
+        # 距离公式 q2+d2-2q·d 的 d2 与 vecs 不匹配 → 近邻错、静默变声错误。
+        # 改为按对象身份键 (id(vecs), shape)，并在缓存条目里**持有 vecs 引用**：
+        # 既保证 id 不复用（对象活着→id 唯一），又用 `entry[0] is vecs` 二次校验。
+        _key = (id(vecs), vecs.shape)
+        _entry = _IVF_D2_CACHE.get(_key)
+        if _entry is not None and _entry[0] is vecs:
+            d2 = _entry[1]
+        else:
             d2 = np.einsum("nd,nd->n", vecs, vecs)
             if len(_IVF_D2_CACHE) > 4:  # 防缓存膨胀（不同尺寸索引共存）
                 _IVF_D2_CACHE.clear()
-            _IVF_D2_CACHE[vecs.shape] = d2
+            _IVF_D2_CACHE[_key] = (vecs, d2)
         for f in range(F):
             b = top[f]
             cand = buckets[b]
@@ -157,9 +173,13 @@ def change_rms(data1, data2, sr1, sr2, rate):
     center pad constant），线性插值到 ``len(data2)``，然后
     ``data2 *= pow(rms1, 1-rate) * pow(rms2, rate-1)``（rms2 取下界 1e-6）。
     """
+    n_out = np.asarray(data2).shape[0]
+    # BUG-013：空输出（n_out=0）短路返回空数组，避免 _interp_linear_size
+    # 内 L_in/n_out 除零 ZeroDivisionError。
+    if n_out == 0:
+        return np.asarray(data2, dtype=np.float32).copy()
     r1 = _rms_curve(np.asarray(data1, dtype=np.float32), int(sr1))
     r2 = _rms_curve(np.asarray(data2, dtype=np.float32), int(sr2))
-    n_out = np.asarray(data2).shape[0]
     r1 = _interp_linear_size(r1, n_out)
     r2 = _interp_linear_size(r2, n_out)
     r2 = np.maximum(r2, np.float32(1e-6))
@@ -196,6 +216,9 @@ def _interp_linear_size(x, n_out, axis=-1):
     """
     x = np.asarray(x, dtype=np.float64)
     L_in = x.shape[axis]
+    # BUG-013：n_out<=0 防御（除零 / 空输出），返回空数组而非 ZeroDivisionError。
+    if n_out <= 0:
+        return np.asarray(x, dtype=np.float32)
     if L_in == n_out:
         return np.asarray(x, dtype=np.float32)
     src = (np.arange(n_out, dtype=np.float64) + 0.5) * (L_in / n_out) - 0.5
@@ -1138,8 +1161,27 @@ class Pipeline(object):
             workers = _parallel_workers(len(bounds))
             _done_lock = threading.Lock()
             block_times = [[0.0, 0.0, 0.0] for _ in bounds]
+            # BUG-007：clarity_mix 现为 thread-local（每请求隔离），并行
+            # worker 子线程默认读不到父线程的值 → 用 initializer 把父线程
+            # 当前 clarity 继承进每个 worker，保持批量并行与串行语义一致。
+            _parent_clarity = None
+            try:
+                from runtime.models import vits as _vits_mod  # noqa: PLC0415
+                _parent_clarity = _vits_mod.get_clarity_mix()
+            except Exception:  # noqa: BLE001
+                pass
+
+            def _init_blk_worker():
+                if _parent_clarity is not None:
+                    try:
+                        from runtime.models import vits as _vits_mod  # noqa: PLC0415
+                        _vits_mod.set_clarity_mix(_parent_clarity)
+                    except Exception:  # noqa: BLE001
+                        pass
+
             with ThreadPoolExecutor(max_workers=workers,
-                                    thread_name_prefix="rvc-blk") as ex:
+                                    thread_name_prefix="rvc-blk",
+                                    initializer=_init_blk_worker) as ex:
                 futures = {
                     ex.submit(run_block, idx, s0, e0, block_times[idx]): idx
                     for idx, (s0, e0) in enumerate(bounds)

@@ -323,16 +323,20 @@ class FCPE:
             local_index = np.clip(local_index, 0, self.out_dims - 1)
             ci_l = np.take_along_axis(cents, local_index, axis=-1)  # [B, F, 9]
             y_l = np.take_along_axis(latent, local_index, axis=-1)
-            decoded = (ci_l * y_l).sum(axis=-1, keepdims=True) / y_l.sum(
-                axis=-1, keepdims=True
-            )
+            # BUG-009：latent 9 个 local bin 全 0 时 y_l.sum()=0 → 0/0=NaN。
+            # 加极小量保护分母（分母为 0 时结果趋 0，与"无信息"语义一致），
+            # 避免 NaN 经 f0=10*2^(decoded/1200) 传播。
+            _denom = y_l.sum(axis=-1, keepdims=True)
+            _denom = np.where(_denom == 0.0, np.float32(1e-30), _denom)
+            decoded = (ci_l * y_l).sum(axis=-1, keepdims=True) / _denom
         else:
             raise ValueError(f"Unknown FCPE decoder mode: {decoder_mode}")
 
         # confidence <= threshold 的帧 decoded 置 -inf（torch 掩码语义），
-        # f0 = 10 * 2^(-inf/1200) = 0
-        mask = np.where(confidence <= threshold, float("-inf"), 1.0)
-        decoded = decoded * mask
+        # f0 = 10 * 2^(-inf/1200) = 0。
+        # BUG-009：用 np.where 直接置值，不用 `decoded * mask`——当 decoded 恰为 0
+        # 且 mask=-inf 时 0*(-inf)=NaN（静默传播）。np.where 规避该 0*inf 陷阱。
+        decoded = np.where(confidence <= threshold, float("-inf"), decoded)
         f0 = 10.0 * np.power(2.0, decoded / 1200.0)
         return f0[..., 0]  # [B, F]
 

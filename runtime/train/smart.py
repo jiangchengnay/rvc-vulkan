@@ -166,16 +166,25 @@ class SmartSampler:
         if step % max(1, self.epoch_segment * self.save_interval) == 0:
             self._finalize_segment(step, out_dir)
 
+    @staticmethod
+    def _snapshot(weights):
+        """深拷贝权重 dict（BUG-011）：训练主循环用 AdamW 就地更新 ndarray，
+        若存引用则落盘时拿到的是"段末最新权重"而非"最优步权重"。快照隔离。
+        """
+        return {k: np.array(v, copy=True) for k, v in (weights or {}).items()}
+
     def _update_segment(self, step, loss, weights):
         if loss < self._seg_best_loss or self._seg_best_step is None:
             self._seg_best_loss = loss
             self._seg_best_step = step
-            self._seg_best_weights = weights
+            # BUG-011：存**快照**而非引用（详见 _snapshot）
+            self._seg_best_weights = self._snapshot(weights)
 
     def _update_memory(self, step, loss, weights, out_dir):
         if not self.prune:
             return
-        self._in_memory.append((loss, step, weights))
+        # BUG-011：内存池同样存快照（淘汰/排序基于历史 loss，权重须冻结）
+        self._in_memory.append((loss, step, self._snapshot(weights)))
         # 末位淘汰：按 loss 排序，保留最优 max_in_memory 个；（淘汰者在段/全局
         # 最优判定已由 _seg_best/全局持有引用，不受影响）
         if len(self._in_memory) > self.max_in_memory:

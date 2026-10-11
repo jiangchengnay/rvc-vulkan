@@ -1211,7 +1211,7 @@ class AutogradTape:
         norm = np.linalg.norm(v64.reshape(v64.shape[0], -1), ord=2, axis=1)
         norm = np.maximum(norm, 1e-12)
 
-        def bp(go, _v=v64, _g=g64, _n=norm):
+        def bp(go, _v=v64, _g=g64, _n=norm, _vref=w_v, _gref=w_g):
             go64 = _td(go)
             g_sh = _g.reshape(-1, *([1] * (_v.ndim - 1)))
             n_sh = _n.reshape(-1, *([1] * (_v.ndim - 1)))
@@ -1224,7 +1224,10 @@ class AutogradTape:
             # dL/dg = <go, v>/n（逐通道；归约到 w_g 原形状）
             gg = dot / _n
             gg = gg.reshape(_g.shape) if gg.shape != tuple(_g.shape) else gg
-            return [(_v, gv), (_g, gg)]
+            # BUG-010：ref 必须返回**调用方原始数组**（w_v/w_g），而非 _td 转换
+            # 副本 v64/g64——当输入 dtype≠tape dtype 时 _td 会新建副本，梯度若
+            # 绑到副本 id，grad_of(原数组) 查 id 落空返回 None（该参数静默不更新）。
+            return [(_vref, gv), (_gref, gg)]
 
         return self._push(bp, out)
 

@@ -892,11 +892,16 @@ class VulkanContext:
         不会影响结果。返回的 buffer 登记进 ``_out_registry``，``free()`` 时
         自动归还。
 
-        QF(2026-09-21)：**诊断发现输出池复用引入音质回归**——mem_alloc 未初始化
-        buffer 被复用时，若某 shader 未全量覆写输出（边界/padding 区），旧值残留
-        污染高频（2s 带宽 15.8k->20.1k，-61.8dB->-57.5dB 复现）。默认 ``RVC_OUT_NO_POOL=1``
-        不复用（每次 mem_alloc 新分配，GPU 分配无 PCIe 传输，实测性能无回归）；
-        精修 shader 覆写后可设 ``RVC_OUT_NO_POOL=0`` 恢复复用。
+        QF(2026-09-21)：输出池复用曾引入音质回归——mem_alloc 未初始化 buffer
+        被复用时，若某 shader 未全量覆写输出（边界/padding 区），旧值残留污染
+        高频（2s 带宽 15.8k->20.1k，-61.8dB->-57.5dB 复现）。
+
+        **默认值（BUG-008 修正）**：当前 ``RVC_OUT_NO_POOL`` 默认 `"0"` ⇒ 池复用
+        **默认开启**（见模块顶部 L203-207：F1 音质修复计划默认恢复池复用——禁池
+        会导致每次 mem_alloc 读未初始化垃圾(全噪声) + descriptor/显存耗尽，
+        比池复用的旧值残留更不可接受）。可用 ``RVC_OUT_NO_POOL=1`` 关闭复用
+        （每次新分配）排障。旧 docstring 曾写"默认 RVC_OUT_NO_POOL=1 不复用"，
+        与实现（默认复用）相反，此处对齐。
         """
         if not _OUT_NO_POOL:
             with self._lock:
@@ -2193,11 +2198,14 @@ class BatchTensor:
     def numpy(self) -> np.ndarray:
         """commit 后下载为 float32 数组（按 ``shape`` 重塑）。
 
-        未 commit 时自动先 ``commit()``（幂等：空批次 no-op；T-H7 链式下
-        numpy bp / 梯度合并消费 BatchTensor 时自动断链提交当前批次）。
-        commit 之前调用抛 ``RuntimeError``；``runner.release()`` 后
-        调用抛 ``RuntimeError``（GPU buffer 已释放）。若 commit 是
-        异步的（``async_=True``），此处会自动 ``wait()`` 后再下载。
+        未 commit 时**自动先 ``commit()``**（幂等：空批次 no-op；T-H7 链式下
+        numpy bp / 梯度合并消费 BatchTensor 时自动断链提交当前批次），
+        不抛错。``runner.release()`` 后调用抛 ``RuntimeError``（GPU buffer
+        已释放）。若 commit 是异步的（``async_=True``），此处会自动
+        ``wait()`` 后再下载。
+
+        （BUG-002 修正：旧 docstring 同时写"自动 commit"与"commit 前抛
+        RuntimeError"，自相矛盾；实现自 T-H7 起即为自动 commit，此处对齐。）
         """
         if self._buf is None:
             raise RuntimeError("BatchTensor 已失效（batch 已 release）")
@@ -4760,9 +4768,10 @@ def _conv_t1d_split_gpu(ctx, x, w, b_arr, stride, padding, output_padding,
     ``ow = il*stride - padding + k*dilation + output_padding``（PyTorch
     conv_transpose1d 语义，单 padding；engine shader 同：
     ``num = lo + padding - kk*dil`` → ``lo = i*stride - padding + kk*dil``）。
-    块输出列 ``[ow0, ow1)`` 需要的输入范围：
-    ``il_lo = max(0, ceil((ow0 + p - (K-1)*d - op)/s))``，
-    ``il_hi = min(L-1, floor((ow1-1 + p - op)/s))``。
+    块输出列 ``[ow0, ow1)`` 需要的输入范围（output_padding 只改输出长度、
+    不参与列坐标映射，故公式不含 op）：
+    ``il_lo = max(0, ceil((ow0 + p - (K-1)*d)/s))``，
+    ``il_hi = min(L-1, floor((ow1-1 + p)/s))``。
     块输入切片 → 引擎 conv_transpose1d（参数不变）→ 输出列从
     ``ow_start = il_lo*stride`` 对齐全局：局部输出列 j 由局部输入 il、tap
     kk 满足 ``j = il*s - p + kk*d + op``，对应全局输入 ``i = il_lo + il``
@@ -4784,11 +4793,13 @@ def _conv_t1d_split_gpu(ctx, x, w, b_arr, stride, padding, output_padding,
         for k in range(n_blocks):
             ow0 = k * chunk
             ow1 = min(oL, ow0 + chunk)
-            # 输入范围按 ow = i*s - p + kk*d + op 反解（注意是**单** padding；
-            # 旧代码误用 +2p，漏掉块尾最后一列输入 tap，导致超限回退的
-            # conv_t 输出错位，实测 max|Δ|~0.5）。
-            il_lo = max(0, -(-(ow0 + p - (K - 1) * d - op) // s))  # ceil 整除
-            il_hi = min(L - 1, (ow1 - 1 + p - op) // s)
+            # 输入范围按 ow = i*s - p + kk*d 反解（注意是**单** padding；
+            # output_padding 只影响输出长度(右侧补 op 列)，不参与输入↔输出
+            # 列坐标映射，故公式中**不得**出现 op）。
+            # BUG-001 修复：旧式 il_lo/il_hi 误减 op，使非末尾切分块少取末尾
+            # tap，块最后一列输出错位（op≠0 且触发切分时 max|Δ|~1.3）。
+            il_lo = max(0, -(-(ow0 + p - (K - 1) * d) // s))  # ceil 整除
+            il_hi = min(L - 1, (ow1 - 1 + p) // s)
             il_lo = max(0, min(il_lo, L - 1))
             xk = x[:, :, il_lo:il_hi + 1]
             ok = ctx.conv_transpose1d(xk, w, b_arr, stride=s, padding=p,
