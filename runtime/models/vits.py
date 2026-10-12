@@ -2140,7 +2140,14 @@ class _GeneratorNSF:
         w = self.w
         cfg = self.cfg
         har = self._sine_gen(f0, ns, seg_offsets=seg_offsets)
-        if self._dec_batch and self._dec_resident:
+        # BUG-014：free_all() 会清空常驻 GPU 权重，但 _dec_batch/_dec_resident 是
+        # 构造时定死的标志 → 若不清，会走"resident 骨架 + 非常驻权重"的混合态，
+        # 与纯逐次路径数值差 ~5e-4。此处动态检查权重是否在池，不在则退化逐次。
+        _w_ok = (_weights.enabled
+                 and _weights.get("dec.ups.0.weight") is not None)
+        _dec_batch = self._dec_batch and _w_ok
+        _dec_resident = self._dec_resident and _w_ok
+        if _dec_batch and _dec_resident:
             # P1-6：整段单 runner 单 commit（conv_pre+cond+ups+ResBlock+平均
             # +尾部全 GPU 驻留，级间免下载）。超限回退走下方逐级 batch 链。
             try:
@@ -2149,7 +2156,7 @@ class _GeneratorNSF:
             except RuntimeError as e:
                 if "vulkan_batch_too_large" not in str(e):
                     raise
-        if self._dec_batch:
+        if _dec_batch:
             try:
                 x = self._dec_conv_pre_batch(z, g)
             except RuntimeError as e:
@@ -2177,7 +2184,7 @@ class _GeneratorNSF:
             if wn is None:
                 wn = _deweight_norm(w[up_base + ".weight_v"],
                                     w[up_base + ".weight_g"])
-            if self._dec_batch:
+            if _dec_batch:
                 try:
                     x = self._dec_ups_batch(i, x, har, up_base, wn)
                 except RuntimeError as e:
@@ -2192,7 +2199,7 @@ class _GeneratorNSF:
             xs = None
             rbs = [self.resblocks[i * self.num_kernels + j]
                    for j in range(self.num_kernels)]
-            if self._dec_batch:
+            if _dec_batch:
                 try:
                     rb_outs = self._resblocks_batch(i, x, rbs)
                 except RuntimeError as e:

@@ -118,8 +118,10 @@ class SmartSampler:
         for step ...:
             ...
             sm.observe(step, losses["loss_total"], net_g.parameters(), out_dir)
-            if sm.should_dump_epoch(step):      # 每保存周期
-                sm.save_segment_if_best(step); sm.save_global_if_best(step)
+
+    段/全局最优的落盘全在 ``observe()`` → ``_finalize_segment()`` 内自动完成
+    （每 ``epoch_段`` 个保存周期一段），调用方无需手动触发。
+    （BUG-018 修正：旧 docstring 引用了不存在的方法。）
     """
 
     def __init__(self, enabled=False, memory_budget_mb=None,

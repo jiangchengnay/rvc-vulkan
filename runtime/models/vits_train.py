@@ -368,6 +368,8 @@ class AutogradTape:
         xs = self._snap(x64)
         B, C, T = x64.shape
         O, Ci, K = w64.shape
+        # BUG-019：支持 b=None（与 conv1d 对称）。None 时用零 bias 前向。
+        b = np.asarray(b) if b is not None else np.zeros(O, dtype=np.float32)
         if O % groups != 0 or C % groups != 0:
             raise ValueError(f"conv1d_groups: O={O}, C={C}, groups={groups}")
         outs = []
@@ -1340,18 +1342,33 @@ class AutogradTape:
     def pad_reflect(self, x, pad_l, pad_r, axis=-1):
         """reflect 边界 pad（对齐原版 F.pad(x, (0,n_pad), 'reflect')）。
 
-        reflect 只是翻转复制边界值，梯度为去掉 pad 区的裁剪。
+        BUG-016：reflect 的反向**不是**去 pad 区裁剪（那是 constant pad 的反向）。
+        reflect 把边界值翻转复制到 pad 区，故反向要把 pad 区梯度**散射累加**
+        回被反射的源位置（每个源位置被引用多次，梯度需相加）。
         """
         x64 = _as_ref(x)
         ax = axis if axis >= 0 else axis + x64.ndim
         shape = [(0, 0)] * x64.ndim
         shape[ax] = (pad_l, pad_r)
         out = np.pad(x64, shape, mode="reflect")
+        L = x64.shape[ax]
+        Lout = out.shape[ax]
+        # 输出位置 j 对应"扩展坐标"(j - pad_l)，再按周期 2*(L-1) 反射回 [0,L-1]
+        idx = np.arange(Lout)
+        if L == 1:
+            src_idx = np.zeros(Lout, dtype=np.int64)
+        else:
+            period = 2 * (L - 1)
+            m = np.mod(idx - pad_l, period)
+            src_idx = np.where(m < L, m, period - m).astype(np.int64)
 
-        def bp(go, _x=x64, a=ax, l=pad_l, r=pad_r):
-            sl = [slice(None)] * go.ndim
-            sl[a] = slice(l, go.shape[a] - r)
-            gx = go[tuple(sl)] if go.shape[a] > l + r else np.zeros_like(_x)
+        def bp(go, _x=x64, a=ax, _src=src_idx, _Lout=Lout):
+            gx = np.zeros_like(_x)
+            go_moved = np.moveaxis(np.asarray(go), a, 0)
+            gx_moved = np.moveaxis(gx, a, 0)
+            for j in range(_Lout):
+                gx_moved[_src[j]] = gx_moved[_src[j]] + go_moved[j]
+            gx = np.moveaxis(gx_moved, 0, a)
             return [(_x, gx)]
 
         return self._push(bp, out)
@@ -3788,6 +3805,12 @@ class SynthesizerTrnTrain:
         m_p, logs_p = self.enc_p.forward(tape, phone, pitch, x_mask)
         y_mask = sequence_mask_np(spec_lengths, spec.shape[-1])
         tape.mark_const(y_mask)
+        # BUG-017：enc_q 后验采样噪声 randn 若为 None 会 fallback 到全局未播种
+        # np.random → train_main(seed=N) 名义可复现实则不可。用传入 rng 生成。
+        if randn is None:
+            randn = rng.standard_normal(
+                (_B, int(self.enc_q.hidden), int(spec.shape[-1]))
+            ).astype(np.float32)
         z, m_q, logs_q = self.enc_q.forward(tape, spec, y_mask, g, randn=randn)
         z_p = self.flow.forward(tape, z, y_mask, g)
         _, ids_slice = rand_slice_segments_np(
